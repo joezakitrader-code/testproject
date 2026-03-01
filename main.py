@@ -1,13 +1,20 @@
 """
-SMC PRO SCANNER v3.2
+SMC PRO SCANNER v4.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FIXES from v3.1:
-  - 4H HH/LL check moved from HARD GATE → SCORE BONUS (+8 pts)
-    • Trending market  → gets +8, easier to hit MIN_SCORE
-    • Choppy market    → no +8, but can still pass with strong OB/trigger
-    • Best of both worlds: high conviction in trends, still fires in ranges
-  - MIN_SCORE stays at 72 — the bonus naturally promotes trending setups
-  - /debug and /help updated to reflect the change
+CHANGES from v3.2:
+  - Entry trigger moved 15M → 1H for higher accuracy signals
+  - 1H engulfing/pin/hammer now the primary trigger (was 15M)
+  - 15M kept only for volume spike confirmation bonus
+  - 1H trigger worth +25 pts (was +20) — reflects higher timeframe weight
+  - OB detection remains on 1H (unchanged)
+  - 4H HH/LL stays as +8 score bonus (not a hard gate)
+  - MIN_SCORE raised 72 → 75 (1H triggers are stronger, bar is higher)
+  - Scan stack: 4H trend → 1H structure + OB + trigger → 15M volume bonus
+
+TIMEFRAME ROLES v4.0:
+  4H  → Trend bias (EMA) + HH/LL structure depth
+  1H  → BOS/MSS + Order Block zone + Entry trigger candle  ← KEY CHANGE
+  15M → Volume spike bonus only
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -33,14 +40,14 @@ warnings.filterwarnings('ignore')
 #  TUNABLE SETTINGS
 # ═══════════════════════════════════════════════
 MAX_SIGNALS_PER_SCAN  = 6
-MIN_SCORE             = 72
+MIN_SCORE             = 75       # raised from 72 — 1H triggers are stronger
 MIN_VOLUME_24H        = 5_000_000
 OB_TOLERANCE_PCT      = 0.008
 OB_IMPULSE_ATR_MULT   = 1.0
 STRUCTURE_LOOKBACK    = 20
 SCAN_INTERVAL_MIN     = 30
-HH_LL_LOOKBACK        = 10    # candles back for HH/LL bonus check
-HH_LL_BONUS           = 8     # score bonus when 4H HH/LL is confirmed
+HH_LL_LOOKBACK        = 10
+HH_LL_BONUS           = 8
 
 
 # ══════════════════════════════════════════════════════════════
@@ -65,21 +72,22 @@ def add_indicators(df):
         df['srsi_k'] = stoch.stochrsi_k()
         df['srsi_d'] = stoch.stochrsi_d()
 
-        df['atr']     = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
 
         bb = ta.volatility.BollingerBands(df['close'], 20, 2)
-        df['bb_upper']  = bb.bollinger_hband()
-        df['bb_lower']  = bb.bollinger_lband()
-        df['bb_pband']  = bb.bollinger_pband()
+        df['bb_upper'] = bb.bollinger_hband()
+        df['bb_lower'] = bb.bollinger_lband()
+        df['bb_pband'] = bb.bollinger_pband()
 
         adx_i = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
-        df['adx']     = adx_i.adx()
-        df['di_pos']  = adx_i.adx_pos()
-        df['di_neg']  = adx_i.adx_neg()
+        df['adx']    = adx_i.adx()
+        df['di_pos'] = adx_i.adx_pos()
+        df['di_neg'] = adx_i.adx_neg()
 
-        df['cmf']     = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
-        df['mfi']     = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
-        df['vol_sma'] = df['volume'].rolling(20).mean()
+        df['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
+        df['mfi'] = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
+
+        df['vol_sma']   = df['volume'].rolling(20).mean()
         df['vol_ratio'] = df['volume'] / df['vol_sma'].replace(0, np.nan)
 
         tp = (df['high'] + df['low'] + df['close']) / 3
@@ -89,6 +97,7 @@ def add_indicators(df):
         uw   = df['high'] - df[['open','close']].max(axis=1)
         lw   = df[['open','close']].min(axis=1) - df['low']
 
+        # ── Trigger candles (now used on 1H) ──────────────────
         df['bull_engulf'] = (
             (df['close'].shift(1) < df['open'].shift(1)) &
             (df['close'] > df['open']) &
@@ -143,32 +152,21 @@ class SMCEngine:
         return highs, lows
 
     def check_4h_hh_ll(self, df_4h, direction, lookback=HH_LL_LOOKBACK):
-        """
-        Compares recent vs prior window of 4H candles.
-        Returns (confirmed: bool, detail: str)
-        Not a hard gate — result is passed to scorer as a bonus.
-        """
         n = len(df_4h)
         if n < lookback * 2:
-            return False, f"⚠️ Not enough 4H data for HH/LL check"
-
+            return False, "⚠️ Not enough 4H data for HH/LL check"
         recent = df_4h.iloc[-lookback:]
         prior  = df_4h.iloc[-(lookback * 2):-lookback]
-
         if direction == 'LONG':
-            recent_hh = recent['high'].max()
-            prior_hh  = prior['high'].max()
-            if recent_hh > prior_hh:
-                return True,  f"📈 4H Higher High ({prior_hh:.5f} → {recent_hh:.5f}) +{HH_LL_BONUS}pts"
-            else:
-                return False, f"➖ 4H no HH yet ({recent_hh:.5f} ≤ {prior_hh:.5f}) — ranging"
+            rh, ph = recent['high'].max(), prior['high'].max()
+            if rh > ph:
+                return True,  f"📈 4H Higher High ({ph:.5f} → {rh:.5f}) +{HH_LL_BONUS}pts"
+            return False, f"➖ 4H no HH ({rh:.5f} ≤ {ph:.5f}) — ranging"
         else:
-            recent_ll = recent['low'].min()
-            prior_ll  = prior['low'].min()
-            if recent_ll < prior_ll:
-                return True,  f"📉 4H Lower Low ({prior_ll:.5f} → {recent_ll:.5f}) +{HH_LL_BONUS}pts"
-            else:
-                return False, f"➖ 4H no LL yet ({recent_ll:.5f} ≥ {prior_ll:.5f}) — ranging"
+            rl, pl = recent['low'].min(), prior['low'].min()
+            if rl < pl:
+                return True,  f"📉 4H Lower Low ({pl:.5f} → {rl:.5f}) +{HH_LL_BONUS}pts"
+            return False, f"➖ 4H no LL ({rl:.5f} ≥ {pl:.5f}) — ranging"
 
     def detect_structure_break(self, df, highs, lows, lookback=STRUCTURE_LOOKBACK):
         events = []
@@ -226,7 +224,6 @@ class SMCEngine:
                 ob_50 = (ob['top'] + ob['bottom']) / 2
                 if (df['close'].iloc[i+1:n] < ob_50).any(): continue
                 obs.append(ob)
-
             else:
                 if c['close'] <= c['open']: continue
                 fwd_low = df['low'].iloc[i+1:min(i+5, n)].min()
@@ -294,7 +291,7 @@ class SMCEngine:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SCORER
+#  SCORER  (1H-based trigger, 15M volume bonus only)
 # ══════════════════════════════════════════════════════════════
 
 def score_setup(direction, ob, structure, sweep, fvg_near,
@@ -303,8 +300,9 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
     reasons = []
     failed = []
 
-    l1  = df_1h.iloc[-1];  p1  = df_1h.iloc[-2]
-    l15 = df_15m.iloc[-1]; p15 = df_15m.iloc[-2]
+    l1  = df_1h.iloc[-1]   # current 1H candle  ← ENTRY TRIGGER SOURCE
+    p1  = df_1h.iloc[-2]   # previous 1H candle
+    l15 = df_15m.iloc[-1]  # used for vol bonus only
     l4  = df_4h.iloc[-1]
 
     # ── 1. Structure (20 pts) ─────────────────────────────────
@@ -349,44 +347,64 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
         else:
             failed.append("⚠️ 4H trend weak for SHORT")
 
-    # ── 4. 4H HH/LL Bonus (8 pts) — NEW ─────────────────────
-    # Not a gate. Trending markets get rewarded, ranging markets still pass.
+    # ── 4. 4H HH/LL Bonus (8 pts) ────────────────────────────
     if hh_ll_confirmed:
         score += HH_LL_BONUS
-        reasons.append(f"🏔️ 4H structure HH/LL confirmed (+{HH_LL_BONUS}pts)")
+        reasons.append(f"🏔️ 4H HH/LL confirmed (+{HH_LL_BONUS}pts)")
     else:
-        failed.append(f"➖ 4H HH/LL not confirmed — ranging (no bonus)")
+        failed.append(f"➖ 4H HH/LL not confirmed — ranging")
 
-    # ── 5. 15M Entry Trigger (20 pts) ────────────────────────
+    # ── 5. 1H Entry Trigger (25 pts) ← UPGRADED FROM 15M ─────
+    # Now reading from 1H candles — much stronger signal weight
     trigger = False
+    trigger_label = ""
+
     if direction == 'LONG':
-        if   l15.get('bull_engulf', 0) == 1:
-            score += 20; trigger = True; reasons.append("🕯️ 15M Bullish Engulfing ✅")
-        elif l15.get('bull_pin', 0) == 1:
-            score += 17; trigger = True; reasons.append("🕯️ 15M Bullish Pin Bar ✅")
-        elif l15.get('hammer', 0) == 1:
-            score += 13; trigger = True; reasons.append("🕯️ 15M Hammer ✅")
-        elif p15.get('bull_engulf', 0) == 1:
-            score += 10; trigger = True; reasons.append("🕯️ 15M Bull Engulf (prev) ✅")
-        elif p15.get('bull_pin', 0) == 1:
-            score += 8;  trigger = True; reasons.append("🕯️ 15M Bull Pin (prev) ✅")
+        if l1.get('bull_engulf', 0) == 1:
+            score += 25; trigger = True
+            trigger_label = "🕯️ 1H Bullish Engulfing ✅ (strongest)"
+        elif l1.get('bull_pin', 0) == 1:
+            score += 22; trigger = True
+            trigger_label = "🕯️ 1H Bullish Pin Bar ✅"
+        elif l1.get('hammer', 0) == 1:
+            score += 18; trigger = True
+            trigger_label = "🕯️ 1H Hammer ✅"
+        elif p1.get('bull_engulf', 0) == 1:
+            score += 14; trigger = True
+            trigger_label = "🕯️ 1H Bull Engulf (prev candle) ✅"
+        elif p1.get('bull_pin', 0) == 1:
+            score += 11; trigger = True
+            trigger_label = "🕯️ 1H Bull Pin (prev candle) ✅"
+        elif p1.get('hammer', 0) == 1:
+            score += 9;  trigger = True
+            trigger_label = "🕯️ 1H Hammer (prev candle) ✅"
     else:
-        if   l15.get('bear_engulf', 0) == 1:
-            score += 20; trigger = True; reasons.append("🕯️ 15M Bearish Engulfing ✅")
-        elif l15.get('bear_pin', 0) == 1:
-            score += 17; trigger = True; reasons.append("🕯️ 15M Bearish Pin Bar ✅")
-        elif l15.get('shooting_star', 0) == 1:
-            score += 13; trigger = True; reasons.append("🕯️ 15M Shooting Star ✅")
-        elif p15.get('bear_engulf', 0) == 1:
-            score += 10; trigger = True; reasons.append("🕯️ 15M Bear Engulf (prev) ✅")
-        elif p15.get('bear_pin', 0) == 1:
-            score += 8;  trigger = True; reasons.append("🕯️ 15M Bear Pin (prev) ✅")
+        if l1.get('bear_engulf', 0) == 1:
+            score += 25; trigger = True
+            trigger_label = "🕯️ 1H Bearish Engulfing ✅ (strongest)"
+        elif l1.get('bear_pin', 0) == 1:
+            score += 22; trigger = True
+            trigger_label = "🕯️ 1H Bearish Pin Bar ✅"
+        elif l1.get('shooting_star', 0) == 1:
+            score += 18; trigger = True
+            trigger_label = "🕯️ 1H Shooting Star ✅"
+        elif p1.get('bear_engulf', 0) == 1:
+            score += 14; trigger = True
+            trigger_label = "🕯️ 1H Bear Engulf (prev candle) ✅"
+        elif p1.get('bear_pin', 0) == 1:
+            score += 11; trigger = True
+            trigger_label = "🕯️ 1H Bear Pin (prev candle) ✅"
+        elif p1.get('shooting_star', 0) == 1:
+            score += 9;  trigger = True
+            trigger_label = "🕯️ 1H Shooting Star (prev candle) ✅"
 
-    if not trigger:
-        score -= 10
-        failed.append("⏳ No 15M trigger candle yet — setup forming")
+    if trigger:
+        reasons.append(trigger_label)
+    else:
+        score -= 12  # harder penalty now — 1H trigger is the backbone
+        failed.append("⏳ No 1H trigger candle yet — setup forming, wait for close")
 
-    # ── 6. Momentum (15 pts) ─────────────────────────────────
+    # ── 6. Momentum (12 pts) ─────────────────────────────────
     rsi1  = l1.get('rsi', 50)
     macd1 = l1.get('macd', 0);  ms1  = l1.get('macd_signal', 0)
     pm1   = p1.get('macd', 0);  pms1 = p1.get('macd_signal', 0)
@@ -394,45 +412,47 @@ def score_setup(direction, ob, structure, sweep, fvg_near,
 
     if direction == 'LONG':
         if 28 <= rsi1 <= 55:
-            score += 5; reasons.append(f"✅ RSI reset zone ({rsi1:.0f})")
+            score += 4; reasons.append(f"✅ RSI reset zone ({rsi1:.0f})")
         elif rsi1 < 28:
-            score += 4; reasons.append(f"✅ RSI oversold ({rsi1:.0f})")
+            score += 3; reasons.append(f"✅ RSI oversold ({rsi1:.0f})")
         if macd1 > ms1 and pm1 <= pms1:
-            score += 6; reasons.append("⚡ MACD bull cross")
+            score += 5; reasons.append("⚡ MACD bull cross")
         elif macd1 > ms1:
-            score += 3; reasons.append("✅ MACD bullish")
+            score += 2; reasons.append("✅ MACD bullish")
         if sk1 < 0.3 and sk1 > sd1:
-            score += 4; reasons.append("⚡ Stoch RSI bull cross")
+            score += 3; reasons.append("⚡ Stoch RSI bull cross")
     else:
         if 45 <= rsi1 <= 72:
-            score += 5; reasons.append(f"✅ RSI overbought zone ({rsi1:.0f})")
+            score += 4; reasons.append(f"✅ RSI overbought zone ({rsi1:.0f})")
         elif rsi1 > 72:
-            score += 4; reasons.append(f"✅ RSI overbought ({rsi1:.0f})")
+            score += 3; reasons.append(f"✅ RSI overbought ({rsi1:.0f})")
         if macd1 < ms1 and pm1 >= pms1:
-            score += 6; reasons.append("⚡ MACD bear cross")
+            score += 5; reasons.append("⚡ MACD bear cross")
         elif macd1 < ms1:
-            score += 3; reasons.append("✅ MACD bearish")
+            score += 2; reasons.append("✅ MACD bearish")
         if sk1 > 0.7 and sk1 < sd1:
-            score += 4; reasons.append("⚡ Stoch RSI bear cross")
+            score += 3; reasons.append("⚡ Stoch RSI bear cross")
 
-    # ── 7. Extras: Sweep / FVG / Volume (10 pts) ─────────────
+    # ── 7. Extras: Sweep / FVG / 15M Vol spike (10 pts) ──────
     extras = 0
     if sweep:
         extras += 4; reasons.append(f"💧 Liq. sweep @ {sweep['level']:.5f}")
     if fvg_near:
-        extras += 3; reasons.append(f"⚡ FVG overlap")
+        extras += 3; reasons.append("⚡ FVG overlaps OB")
 
+    # 15M volume — only bonus use of 15M now
     vr15 = l15.get('vol_ratio', 1.0)
     if   vr15 >= 2.5:
-        extras += 3; reasons.append(f"🚀 Vol spike {vr15:.1f}x")
+        extras += 3; reasons.append(f"🚀 15M vol spike {vr15:.1f}x")
     elif vr15 >= 1.5:
-        extras += 1; reasons.append(f"✅ Elevated vol {vr15:.1f}x")
+        extras += 1; reasons.append(f"✅ 15M elevated vol {vr15:.1f}x")
 
+    # 1H VWAP confirmation
     close1 = l1.get('close', 0); vwap1 = l1.get('vwap', 0)
     if direction == 'LONG' and close1 < vwap1:
-        extras = min(extras+1, 10); reasons.append("✅ Below VWAP")
+        extras = min(extras+1, 10); reasons.append("✅ 1H below VWAP")
     elif direction == 'SHORT' and close1 > vwap1:
-        extras = min(extras+1, 10); reasons.append("✅ Above VWAP")
+        extras = min(extras+1, 10); reasons.append("✅ 1H above VWAP")
 
     score += min(extras, 10)
 
@@ -465,8 +485,6 @@ class SMCProScanner:
             'last_scan': None, 'pairs_scanned': 0
         }
 
-    # ── Exchange ──────────────────────────────────────────────
-
     async def get_pairs(self):
         try:
             await self.exchange.load_markets()
@@ -486,7 +504,9 @@ class SMCProScanner:
     async def fetch_data(self, symbol):
         try:
             result = {}
-            for tf, lim in [('4h', 220), ('1h', 130), ('15m', 110)]:
+            for tf, lim in [('4h', 220), ('1h', 150), ('15m', 80)]:
+                # 1H gets more candles now (it's doing more work)
+                # 15M only needs recent candles for vol check
                 raw = await self.exchange.fetch_ohlcv(symbol, tf, limit=lim)
                 df  = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
                 df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -496,32 +516,28 @@ class SMCProScanner:
         except Exception as e:
             logger.error(f"Fetch {symbol}: {e}"); return None
 
-    # ── Analysis ──────────────────────────────────────────────
-
     def analyse(self, data, symbol):
         debug = {'symbol': symbol.replace('/USDT:USDT',''), 'gates': [], 'score': 0, 'bias': '?'}
 
         try:
             df4 = data['4h']; df1 = data['1h']; df15 = data['15m']
-            if len(df1) < 80 or len(df15) < 60:
+            if len(df1) < 80 or len(df15) < 40:
                 debug['gates'].append('❌ Not enough candle data')
                 return None, debug
 
-            price = df15['close'].iloc[-1]
+            price = df1['close'].iloc[-1]   # price from 1H now (more stable)
 
             # Gate 1: 4H Bias
             l4 = df4.iloc[-1]
             e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0)
-            if e21 > e50:
-                bias = 'LONG'
-            elif e21 < e50:
-                bias = 'SHORT'
+            if e21 > e50:       bias = 'LONG'
+            elif e21 < e50:     bias = 'SHORT'
             else:
                 debug['gates'].append('❌ 4H EMAs flat — no bias')
                 return None, debug
             debug['bias'] = bias
 
-            # HH/LL check — NOT a gate, result passed to scorer
+            # HH/LL bonus check (not a gate)
             hh_ll_ok, hh_ll_msg = self.smc.check_4h_hh_ll(df4, bias, HH_LL_LOOKBACK)
             debug['gates'].append(hh_ll_msg)
 
@@ -549,44 +565,42 @@ class SMCProScanner:
                     return None, debug
                 debug['gates'].append(f'✅ Structure: {structure["kind"]}')
             else:
-                debug['gates'].append('⚠️ No recent BOS/MSS (structure score=0 but continuing)')
+                debug['gates'].append('⚠️ No recent BOS/MSS (score=0 but continuing)')
 
-            # Gate 4: Order Block (HARD GATE)
+            # Gate 4: 1H Order Block (HARD GATE)
             obs = self.smc.find_order_blocks(df1, bias, lookback=60)
             if not obs:
-                debug['gates'].append(f'❌ No valid {bias} OBs found on 1H')
+                debug['gates'].append(f'❌ No valid {bias} OBs on 1H')
                 return None, debug
             debug['gates'].append(f'✅ {len(obs)} OB(s) found on 1H')
 
             active_ob = None
             for ob in obs:
                 if self.smc.price_in_ob(price, ob, OB_TOLERANCE_PCT):
-                    active_ob = ob
-                    break
+                    active_ob = ob; break
 
             if not active_ob:
-                nearest = obs[0]
-                dist = min(abs(price - nearest['top']), abs(price - nearest['bottom']))
-                dist_pct = dist / price * 100
+                nearest   = obs[0]
+                dist_pct  = min(abs(price - nearest['top']), abs(price - nearest['bottom'])) / price * 100
                 debug['gates'].append(f'❌ Price not at OB — nearest {dist_pct:.2f}% away [{nearest["bottom"]:.5f}–{nearest["top"]:.5f}]')
                 return None, debug
             debug['gates'].append(f'✅ Price IN OB [{active_ob["bottom"]:.5f}–{active_ob["top"]:.5f}]')
 
-            # FVG + Sweep (bonus only)
-            fvgs = self.smc.find_fvg(df15, bias, lookback=25)
+            # FVG on 1H (bonus)
+            fvgs = self.smc.find_fvg(df1, bias, lookback=25)
             fvg_near = None
             for fvg in fvgs:
                 if fvg['bottom'] < active_ob['top'] and fvg['top'] > active_ob['bottom']:
                     fvg_near = fvg; break
             if fvg_near:
-                debug['gates'].append('✅ FVG overlaps OB')
+                debug['gates'].append('✅ 1H FVG overlaps OB')
 
-            highs15, lows15 = self.smc.swing_highs_lows(df15, left=3, right=3)
-            sweep = self.smc.recent_liquidity_sweep(df15, bias, highs15, lows15, lookback=25)
+            # Liquidity sweep on 1H
+            sweep = self.smc.recent_liquidity_sweep(df1, bias, highs1, lows1, lookback=20)
             if sweep:
-                debug['gates'].append(f'✅ Liq sweep found @ {sweep["level"]:.5f}')
+                debug['gates'].append(f'✅ 1H liq sweep @ {sweep["level"]:.5f}')
 
-            # Score — pass hh_ll_ok as bonus flag
+            # Score
             score, reasons, failed = score_setup(
                 bias, active_ob, structure, sweep, fvg_near,
                 df1, df15, df4, pd_label, hh_ll_ok
@@ -614,7 +628,7 @@ class SMCProScanner:
 
             risk = abs(entry - sl)
             if risk < entry * 0.001:
-                debug['gates'].append('❌ Degenerate SL (risk too small)')
+                debug['gates'].append('❌ Degenerate SL')
                 return None, debug
 
             if bias == 'LONG':
@@ -624,32 +638,31 @@ class SMCProScanner:
 
             rr       = [abs(t - entry) / risk for t in tps]
             risk_pct = risk / entry * 100
-
-            tid = f"{symbol.split('/')[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            tid      = f"{symbol.split('/')[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
             sig = {
-                'trade_id':       tid,
-                'symbol':         symbol.replace('/USDT:USDT', ''),
-                'full_symbol':    symbol,
-                'signal':         bias,
-                'quality':        quality,
-                'score':          score,
-                'hh_ll':          hh_ll_ok,   # stored for display
-                'entry':          entry,
-                'stop_loss':      sl,
-                'targets':        tps,
-                'rr':             rr,
-                'risk_pct':       risk_pct,
-                'ob':             active_ob,
-                'fvg':            fvg_near,
-                'sweep':          sweep,
-                'structure':      structure,
-                'pd_zone':        pd_label,
-                'pd_pos':         pd_pos,
-                'reasons':        reasons,
-                'tp_hit':         [False, False, False],
-                'sl_hit':         False,
-                'timestamp':      datetime.now(),
+                'trade_id':    tid,
+                'symbol':      symbol.replace('/USDT:USDT', ''),
+                'full_symbol': symbol,
+                'signal':      bias,
+                'quality':     quality,
+                'score':       score,
+                'hh_ll':       hh_ll_ok,
+                'entry':       entry,
+                'stop_loss':   sl,
+                'targets':     tps,
+                'rr':          rr,
+                'risk_pct':    risk_pct,
+                'ob':          active_ob,
+                'fvg':         fvg_near,
+                'sweep':       sweep,
+                'structure':   structure,
+                'pd_zone':     pd_label,
+                'pd_pos':      pd_pos,
+                'reasons':     reasons,
+                'tp_hit':      [False, False, False],
+                'sl_hit':      False,
+                'timestamp':   datetime.now(),
             }
             debug['gates'].append(f'✅ PASSED — Score {score}')
             return sig, debug
@@ -659,34 +672,33 @@ class SMCProScanner:
             debug['gates'].append(f'💥 Exception: {e}')
             return None, debug
 
-    # ── Signal Formatter ──────────────────────────────────────
-
     def fmt(self, s):
-        arrow = '🟢' if s['signal'] == 'LONG' else '🔴'
-        icon  = '🚀' if s['signal'] == 'LONG' else '🔻'
-        bar   = '█' * int(s['score']/10) + '░' * (10 - int(s['score']/10))
-        z     = {'DISCOUNT':'🟩 DISCOUNT','PREMIUM':'🟥 PREMIUM','NEUTRAL':'🟨 NEUTRAL'}.get(s['pd_zone'],'')
-        ob    = s['ob']
-        hh_ll_tag = '🏔️ Trending (HH/LL ✅)' if s.get('hh_ll') else '〰️ Ranging (no HH/LL)'
+        arrow    = '🟢' if s['signal'] == 'LONG' else '🔴'
+        icon     = '🚀' if s['signal'] == 'LONG' else '🔻'
+        bar      = '█' * int(s['score']/10) + '░' * (10 - int(s['score']/10))
+        z        = {'DISCOUNT':'🟩 DISCOUNT','PREMIUM':'🟥 PREMIUM','NEUTRAL':'🟨 NEUTRAL'}.get(s['pd_zone'],'')
+        ob       = s['ob']
+        hh_tag   = '🏔️ Trending (HH/LL ✅)' if s.get('hh_ll') else '〰️ Ranging (no HH/LL)'
 
         msg  = f"{'━'*40}\n"
-        msg += f"{icon} <b>SMC PRO — {s['quality']}</b> {icon}\n"
+        msg += f"{icon} <b>SMC PRO v4 — {s['quality']}</b> {icon}\n"
         msg += f"{'━'*40}\n\n"
         msg += f"<b>🆔</b> <code>{s['trade_id']}</code>\n"
-        msg += f"<b>📊 PAIR:</b>  <b>#{s['symbol']}USDT</b>\n"
-        msg += f"<b>📍 DIR:</b>   {arrow} <b>{s['signal']}</b>\n"
-        msg += f"<b>🗺️ ZONE:</b>  {z}  ({s['pd_pos']*100:.0f}% of range)\n"
-        msg += f"<b>📐 4H STR:</b> {hh_ll_tag}\n\n"
+        msg += f"<b>📊 PAIR:</b>    <b>#{s['symbol']}USDT</b>\n"
+        msg += f"<b>📍 DIR:</b>     {arrow} <b>{s['signal']}</b>\n"
+        msg += f"<b>🗺️ ZONE:</b>    {z} ({s['pd_pos']*100:.0f}%)\n"
+        msg += f"<b>📐 4H STR:</b>  {hh_tag}\n"
+        msg += f"<b>⏱ ENTRY TF:</b> 1H candle trigger\n\n"
         msg += f"<b>⭐ SCORE: {s['score']} / 100</b>\n"
         msg += f"<code>[{bar}]</code>\n\n"
-        msg += f"<b>📦 ORDER BLOCK:</b>\n"
+        msg += f"<b>📦 ORDER BLOCK (1H):</b>\n"
         msg += f"  Top:    <code>${ob['top']:.6f}</code>\n"
         msg += f"  Bottom: <code>${ob['bottom']:.6f}</code>\n"
         msg += f"  Mid:    <code>${ob['mid']:.6f}</code>\n\n"
         msg += f"<b>💰 ENTRY NOW:</b> <code>${s['entry']:.6f}</code>\n\n"
         msg += f"<b>🎯 TARGETS:</b>\n"
         for (lbl, eta), tp, rr in zip(
-            [('TP1 — 50% exit','4-8h'),('TP2 — 30% exit','10-18h'),('TP3 — 20% exit','18-28h')],
+            [('TP1 — 50% exit','6-12h'),('TP2 — 30% exit','12-24h'),('TP3 — 20% exit','24-48h')],
             s['targets'], s['rr']
         ):
             pct = abs((tp - s['entry'])/s['entry']*100)
@@ -695,7 +707,7 @@ class SMCProScanner:
         msg += f"<b>🛑 STOP LOSS:</b> <code>${s['stop_loss']:.6f}</code>  (-{s['risk_pct']:.2f}%)\n"
         msg += f"  └ <i>1H close below OB = invalidated</i>\n\n"
         if s['structure']:
-            sk = s['structure']['kind']
+            sk  = s['structure']['kind']
             lbl = '🔄 MSS — Early Reversal' if 'MSS' in sk else '💥 BOS — Pullback Entry'
             msg += f"<b>🏗️ STRUCTURE:</b> {lbl}\n\n"
         msg += f"<b>📋 CONFLUENCE:</b>\n"
@@ -708,8 +720,6 @@ class SMCProScanner:
         msg += f"{'━'*40}"
         return msg
 
-    # ── Telegram ──────────────────────────────────────────────
-
     async def send(self, text):
         try:
             await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML)
@@ -717,9 +727,9 @@ class SMCProScanner:
             logger.error(f"Telegram: {e}")
 
     async def tp_alert(self, t, n, price):
-        tp = t['targets'][n-1]
+        tp  = t['targets'][n-1]
         pct = abs((tp - t['entry'])/t['entry']*100)
-        advice = {1:'Close 50% → Move SL to breakeven', 2:'Close 30% → Trail stop tight', 3:'Close final 20% 🎊 Done!'}
+        advice = {1:'Close 50% → Move SL to breakeven', 2:'Close 30% → Trail stop tight', 3:'Close final 20% 🎊'}
         msg  = f"🎯 <b>TP{n} HIT!</b>\n\n<code>{t['trade_id']}</code>\n<b>{t['symbol']}</b> {t['signal']}\n\n"
         msg += f"Target: <code>${tp:.6f}</code>\nCurrent: <code>${price:.6f}</code>\nProfit: <b>+{pct:.2f}%</b>\n\n"
         msg += f"📋 {advice[n]}"
@@ -733,8 +743,6 @@ class SMCProScanner:
         await self.send(msg)
         self.stats['sl'] += 1
 
-    # ── Tracker ───────────────────────────────────────────────
-
     async def track(self):
         logger.info("📡 Tracker started")
         while True:
@@ -744,8 +752,8 @@ class SMCProScanner:
                 remove = []
                 for tid, t in list(self.active_trades.items()):
                     try:
-                        if datetime.now() - t['timestamp'] > timedelta(hours=28):
-                            await self.send(f"⏰ <b>28H TIMEOUT</b>\n<code>{tid}</code>\n{t['symbol']} — Close manually.")
+                        if datetime.now() - t['timestamp'] > timedelta(hours=48):
+                            await self.send(f"⏰ <b>48H TIMEOUT</b>\n<code>{tid}</code>\n{t['symbol']} — Close manually.")
                             remove.append(tid); continue
                         ticker = await self.exchange.fetch_ticker(t['full_symbol'])
                         p = ticker['last']
@@ -771,8 +779,6 @@ class SMCProScanner:
             except Exception as e:
                 logger.error(f"Track loop: {e}"); await asyncio.sleep(60)
 
-    # ── Scanner ───────────────────────────────────────────────
-
     async def scan(self):
         if self.is_scanning:
             return []
@@ -780,16 +786,16 @@ class SMCProScanner:
         logger.info("🔍 Scan starting...")
 
         await self.send(
-            f"🔍 <b>SMC SCAN STARTED</b>\n"
-            f"Min score: {MIN_SCORE}/100 | Max signals: {MAX_SIGNALS_PER_SCAN}\n"
-            f"OB tolerance: {OB_TOLERANCE_PCT*100:.1f}% | Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M\n"
-            f"4H HH/LL bonus: +{HH_LL_BONUS}pts (not a gate)"
+            f"🔍 <b>SMC v4.0 SCAN STARTED</b>\n"
+            f"Entry: <b>1H trigger</b> | Structure: 1H | Trend: 4H\n"
+            f"Min score: {MIN_SCORE} | OB tol: {OB_TOLERANCE_PCT*100:.1f}%\n"
+            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | HH/LL bonus: +{HH_LL_BONUS}pts"
         )
 
-        pairs = await self.get_pairs()
-        candidates = []
+        pairs       = await self.get_pairs()
+        candidates  = []
         near_misses = []
-        scanned = 0
+        scanned     = 0
 
         for pair in pairs:
             try:
@@ -798,7 +804,7 @@ class SMCProScanner:
                     sig, dbg = self.analyse(data, pair)
                     if sig:
                         candidates.append(sig)
-                        logger.info(f"  💎 {pair} {sig['signal']} score={sig['score']} hh_ll={sig['hh_ll']}")
+                        logger.info(f"  💎 {pair} {sig['signal']} score={sig['score']}")
                     else:
                         if dbg['score'] > 0 and any('✅ Price IN OB' in g for g in dbg['gates']):
                             near_misses.append(dbg)
@@ -833,20 +839,19 @@ class SMCProScanner:
         pr = sum(1 for s in top if 'PREMIUM' in s['quality'])
         hi = len(top) - el - pr
         lg = sum(1 for s in top if s['signal'] == 'LONG')
-        tr = sum(1 for s in top if s.get('hh_ll'))   # trending count
+        tr = sum(1 for s in top if s.get('hh_ll'))
 
-        summ  = f"✅ <b>SCAN COMPLETE</b>\n\n"
-        summ += f"📊 Pairs scanned:  {scanned}\n"
-        summ += f"🔍 Candidates:     {len(candidates)}\n"
-        summ += f"🎯 Signals sent:   {len(top)}\n"
+        summ  = f"✅ <b>SCAN COMPLETE — v4.0</b>\n\n"
+        summ += f"📊 Pairs scanned: {scanned}\n"
+        summ += f"🔍 Candidates:    {len(candidates)}\n"
+        summ += f"🎯 Signals sent:  {len(top)}\n"
         if top:
             summ += f"  👑 Elite:    {el}\n  💎 Premium:  {pr}\n  🔥 High:     {hi}\n"
             summ += f"  🟢 Long:     {lg}\n  🔴 Short:    {len(top)-lg}\n"
             summ += f"  🏔️ Trending: {tr}\n  〰️ Ranging:  {len(top)-tr}\n"
         else:
             summ += f"\n<i>No setups met criteria this scan.</i>\n"
-            summ += f"Near misses (at OB but low score): {len(near_misses)}\n"
-            summ += f"Use /debug to see why they failed."
+            summ += f"Near misses: {len(near_misses)} — use /debug\n"
         summ += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
         await self.send(summ)
 
@@ -854,20 +859,19 @@ class SMCProScanner:
         self.is_scanning = False
         return top
 
-    # ── Run Loop ──────────────────────────────────────────────
-
     async def run(self, interval_min=SCAN_INTERVAL_MIN):
-        logger.info("🚀 SMC Pro v3.2 starting")
+        logger.info("🚀 SMC Pro v4.0 starting")
         await self.send(
-            "👑 <b>SMC PRO v3.2 — ORDER BLOCK SCANNER</b> 👑\n\n"
+            "👑 <b>SMC PRO v4.0 — ORDER BLOCK SCANNER</b> 👑\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>15M Entry | 1H Structure | 4H Trend</b>\n\n"
+            "<b>4H Trend  →  1H Structure + OB + Entry  →  15M Vol</b>\n\n"
+            f"✅ Entry trigger: <b>1H candles</b> (upgraded from 15M)\n"
             f"✅ Min score: {MIN_SCORE}/100\n"
-            f"✅ Max signals: {MAX_SIGNALS_PER_SCAN} per scan\n"
             f"✅ OB tolerance: {OB_TOLERANCE_PCT*100:.1f}%\n"
             f"✅ Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M/day\n"
-            f"✅ 4H HH/LL bonus: +{HH_LL_BONUS}pts (not a hard gate)\n"
-            f"✅ Scan every {interval_min} min\n\n"
+            f"✅ 4H HH/LL bonus: +{HH_LL_BONUS}pts\n"
+            f"✅ Trade timeout: 48H\n"
+            f"✅ Scan every: {SCAN_INTERVAL_MIN} min\n\n"
             "Commands: /scan /stats /trades /debug /help\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -894,11 +898,9 @@ class Commands:
 
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "👑 <b>SMC Pro v3.2</b>\n\n"
-            "Best-of-both scanner:\n"
-            "• 4H HH/LL = score bonus (+8pts), NOT a hard gate\n"
-            "• Trending markets score higher automatically\n"
-            "• Ranging markets can still fire with strong confluence\n\n"
+            "👑 <b>SMC Pro v4.0</b>\n\n"
+            "1H entry trigger — cleaner, stronger signals.\n\n"
+            "Stack: 4H trend → 1H structure + OB + trigger → 15M vol\n\n"
             "/scan /stats /trades /debug /help",
             parse_mode=ParseMode.HTML
         )
@@ -911,7 +913,7 @@ class Commands:
 
     async def stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         s = self.s.stats
-        msg  = "📊 <b>SMC PRO STATS</b>\n\n"
+        msg  = "📊 <b>SMC PRO v4.0 STATS</b>\n\n"
         msg += f"Total signals: {s['total']}\n"
         msg += f"  👑 Elite: {s['elite']}  💎 Premium: {s['premium']}  🔥 High: {s['high']}\n"
         msg += f"  🟢 Long: {s['long']}  🔴 Short: {s['short']}\n\n"
@@ -927,8 +929,8 @@ class Commands:
             await u.message.reply_text("📭 No active trades."); return
         msg = f"📡 <b>ACTIVE TRADES ({len(self.s.active_trades)})</b>\n\n"
         for tid, t in list(self.s.active_trades.items())[:10]:
-            age  = int((datetime.now() - t['timestamp']).total_seconds()/3600)
-            tps  = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
+            age      = int((datetime.now() - t['timestamp']).total_seconds()/3600)
+            tps      = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
             trend_tag = '🏔️' if t.get('hh_ll') else '〰️'
             msg += (f"<b>{t['symbol']}</b> {t['signal']} {trend_tag} — {t['quality']}\n"
                     f"  Entry: <code>${t['entry']:.5f}</code> | Score: {t['score']}\n"
@@ -937,49 +939,45 @@ class Commands:
 
     async def debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not self.s.last_debug:
-            await u.message.reply_text(
-                "📭 No debug data yet. Run /scan first.",
-                parse_mode=ParseMode.HTML
-            ); return
-        msg = f"🔬 <b>NEAR MISSES — Last Scan</b>\n"
-        msg += f"<i>(At OB but below score threshold)</i>\n\n"
+            await u.message.reply_text("📭 No debug data yet. Run /scan first.", parse_mode=ParseMode.HTML)
+            return
+        msg = "🔬 <b>NEAR MISSES — Last Scan</b>\n"
+        msg += "<i>(At OB but below score threshold)</i>\n\n"
         for d in self.s.last_debug[:8]:
             msg += f"<b>{d['symbol']}</b> {d['bias']} — Score: {d['score']}/100\n"
             for g in d['gates'][-4:]:
                 msg += f"  {g}\n"
             msg += "\n"
-        msg += f"<i>Min score: {MIN_SCORE}. HH/LL bonus = +{HH_LL_BONUS}pts when trending.</i>"
+        msg += f"<i>Min score: {MIN_SCORE}. 1H trigger = up to +25pts.</i>"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>SMC PRO v3.2 — STRATEGY</b>\n\n"
-        msg += "<b>Timeframes:</b>\n"
-        msg += "  4H → Trend + HH/LL depth check\n"
-        msg += "  1H → BOS/MSS + Order Block\n"
-        msg += "  15M → Entry trigger\n\n"
+        msg  = "📚 <b>SMC PRO v4.0 — STRATEGY</b>\n\n"
+        msg += "<b>Timeframe Stack:</b>\n"
+        msg += "  4H  → EMA bias + HH/LL depth\n"
+        msg += "  1H  → BOS/MSS + OB zone + Entry trigger  ← core\n"
+        msg += "  15M → Volume spike bonus only\n\n"
         msg += "<b>Hard Gates (ALL must pass):</b>\n"
-        msg += "  1️⃣ 4H EMA 21/50 bias confirmed\n"
-        msg += "  2️⃣ PD zone OK (no longs in premium)\n"
+        msg += "  1️⃣ 4H EMA 21/50 bias\n"
+        msg += "  2️⃣ PD zone (no longs premium / no shorts discount)\n"
         msg += "  3️⃣ 1H BOS/MSS within 20 candles\n"
-        msg += "  4️⃣ Price tapping a valid 1H Order Block\n"
+        msg += "  4️⃣ Price at valid 1H Order Block\n"
         msg += f"  5️⃣ Score ≥ {MIN_SCORE}/100\n\n"
-        msg += "<b>Score System:</b>\n"
-        msg += f"  +20 — Tight OB (<0.8%)\n"
-        msg += f"  +20 — 15M trigger candle\n"
-        msg += f"  +20 — MSS (early reversal)\n"
-        msg += f"  +15 — 4H triple EMA aligned\n"
-        msg += f"  +{HH_LL_BONUS}  — 4H HH/LL confirmed 🏔️ ← NEW\n"
-        msg += f"  +15 — Momentum (RSI/MACD/Stoch)\n"
-        msg += f"  +10 — Extras (sweep/FVG/volume)\n\n"
-        msg += "<b>Logic:</b>\n"
-        msg += "  Trending market  → HH/LL bonus makes score easier ✅\n"
-        msg += "  Ranging market   → Can still pass with other confluence\n\n"
-        msg += "<b>SL/TP:</b>\n"
-        msg += "  SL  = below/above OB + 0.2× ATR\n"
-        msg += "  TP1 = 1:1.5 RR | TP2 = 1:2.5 | TP3 = 1:4.0\n\n"
+        msg += "<b>Score System (max 100):</b>\n"
+        msg += "  +25 — 1H entry trigger (engulf/pin/hammer) ⭐ main\n"
+        msg += "  +20 — MSS structure\n"
+        msg += "  +20 — Tight OB quality\n"
+        msg += "  +15 — 4H triple EMA\n"
+        msg += f"  +{HH_LL_BONUS}  — 4H HH/LL confirmed\n"
+        msg += "  +12 — Momentum (RSI/MACD/Stoch)\n"
+        msg += "  +10 — Extras (sweep/FVG/vol)\n\n"
+        msg += "<b>TP timing adjusted for 1H entries:</b>\n"
+        msg += "  TP1 = 1:1.5 RR  [6-12h]\n"
+        msg += "  TP2 = 1:2.5 RR  [12-24h]\n"
+        msg += "  TP3 = 1:4.0 RR  [24-48h]\n\n"
         msg += "<b>Config:</b>\n"
         msg += f"  MIN_SCORE={MIN_SCORE} | HH_LL_BONUS={HH_LL_BONUS}\n"
-        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | HH_LL_LOOKBACK={HH_LL_LOOKBACK}"
+        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | LOOKBACK={HH_LL_LOOKBACK}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -1014,7 +1012,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SMC Pro v3.2 ready!")
+    logger.info("🤖 SMC Pro v4.0 ready!")
 
     try:
         await scanner.run(interval_min=SCAN_INTERVAL_MIN)
