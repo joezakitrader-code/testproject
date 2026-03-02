@@ -988,7 +988,7 @@ class Commands:
 async def main():
     # ════════════ CONFIG ════════════
     TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
-    TELEGRAM_CHAT_ID = "7500072234"
+    TELEGRAM_CHAT_ID = "-1002442074724"
     BINANCE_API_KEY  = None
     BINANCE_SECRET   = None
     # ════════════════════════════════
