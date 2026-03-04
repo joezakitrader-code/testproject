@@ -316,6 +316,7 @@ class AdvancedDayTradingScanner:
             return df
 
     def detect_volume_spike(self, df):
+        """Legacy spike check — kept for backward compat, used internally."""
         if len(df) < 20:
             return False, 1.0
         recent = df['volume'].iloc[-1]
@@ -324,6 +325,90 @@ class AdvancedDayTradingScanner:
             return False, 1.0
         ratio = recent / avg
         return recent > avg * 2.5, ratio
+
+    def analyze_volume_direction(self, df, lookback=6):
+        """
+        Determine if volume is genuinely backing a LONG or SHORT move.
+
+        Checks 4 things:
+          1. Buying vs selling volume split (candle body direction x volume)
+          2. Whether recent volume is above average (active market)
+          3. Volume trend — is it rising or fading into the move?
+          4. Large candle bodies with high volume (conviction candles)
+
+        Returns:
+            long_vol_ok  : bool  — volume confirms a long
+            short_vol_ok : bool  — volume confirms a short
+            vol_ratio    : float — recent vol vs 20-bar avg
+            buy_pct      : float — pct of recent volume that is buying
+        """
+        if len(df) < max(lookback, 20):
+            return False, False, 1.0, 50.0
+
+        closes  = df['close'].values
+        opens   = df['open'].values
+        volumes = df['volume'].values
+        highs   = df['high'].values
+        lows    = df['low'].values
+
+        avg_vol = volumes[-20:].mean()
+        if avg_vol == 0 or np.isnan(avg_vol):
+            return False, False, 1.0, 50.0
+
+        recent_vol = volumes[-lookback:]
+        vol_ratio  = recent_vol.mean() / avg_vol   # >1 = above-average activity
+
+        # 1. Buy / Sell volume split using candle wick analysis
+        buy_vol  = 0.0
+        sell_vol = 0.0
+        for i in range(-lookback, 0):
+            candle_range = highs[i] - lows[i]
+            if candle_range == 0:
+                continue
+            buy_frac  = (closes[i] - lows[i])  / candle_range
+            sell_frac = (highs[i]  - closes[i]) / candle_range
+            buy_vol  += volumes[i] * buy_frac
+            sell_vol += volumes[i] * sell_frac
+
+        total_vol = buy_vol + sell_vol
+        buy_pct   = (buy_vol / total_vol * 100) if total_vol > 0 else 50.0
+
+        # 2. Volume trend — rising into the move or fading?
+        mid        = lookback // 2
+        early      = volumes[-lookback : -mid].mean()
+        late       = volumes[-mid:].mean()
+        vol_rising = late > early * 1.1    # 10% increase = rising
+        vol_fading = late < early * 0.85   # 15% drop = fading
+
+        # 3. Conviction candles: big body + above-avg volume
+        long_conviction  = 0
+        short_conviction = 0
+        for i in range(-lookback, 0):
+            body         = abs(closes[i] - opens[i])
+            candle_range = highs[i] - lows[i] if highs[i] != lows[i] else 1
+            body_pct     = body / candle_range
+            if volumes[i] > avg_vol and body_pct > 0.5:
+                if closes[i] > opens[i]:
+                    long_conviction += 1
+                else:
+                    short_conviction += 1
+
+        # Decision gates
+        long_vol_ok = (
+            buy_pct > 55 and
+            vol_ratio > 0.8 and
+            (vol_rising or long_conviction >= 2) and
+            not (buy_pct < 45 and vol_fading)
+        )
+
+        short_vol_ok = (
+            buy_pct < 45 and
+            vol_ratio > 0.8 and
+            (vol_rising or short_conviction >= 2) and
+            not (buy_pct > 55 and vol_fading)
+        )
+
+        return long_vol_ok, short_vol_ok, vol_ratio, buy_pct
 
     def detect_signal(self, data, symbol):
         try:
@@ -351,6 +436,7 @@ class AdvancedDayTradingScanner:
                     return None
 
             volume_spike, vol_ratio = self.detect_volume_spike(df_1h)
+            long_vol_ok, short_vol_ok, vol_ratio, buy_pct = self.analyze_volume_direction(df_1h, lookback=6)
 
             # ── ORDER BLOCK DETECTION ────────────────────────────────
             # Detect on 1H (primary) and 4H (higher timeframe confirmation)
@@ -457,13 +543,22 @@ class AdvancedDayTradingScanner:
                 short_reasons.append('UO Overbought')
 
             # ── VOLUME (5 pts) ───────────────────────────────────────
+            # Directional volume — only score in the right direction
+            if long_vol_ok:
+                long_score += 3
+                long_reasons.append(f'📈 Buy Vol Confirmed ({buy_pct:.0f}% buying, {vol_ratio:.1f}x avg)')
+            if short_vol_ok:
+                short_score += 3
+                short_reasons.append(f'📉 Sell Vol Confirmed ({100-buy_pct:.0f}% selling, {vol_ratio:.1f}x avg)')
+
+            # Extra spike bonus — still valid but only when direction matches
             if volume_spike:
-                if latest_1h['close'] > prev_1h['close']:
-                    long_score += 3
-                    long_reasons.append(f'🚀 VOL SPIKE ({vol_ratio:.1f}x)')
-                else:
-                    short_score += 3
-                    short_reasons.append(f'💥 VOL DUMP ({vol_ratio:.1f}x)')
+                if latest_1h['close'] > prev_1h['close'] and long_vol_ok:
+                    long_score += 1
+                    long_reasons.append(f'🚀 Vol Spike ({vol_ratio:.1f}x)')
+                elif latest_1h['close'] < prev_1h['close'] and short_vol_ok:
+                    short_score += 1
+                    short_reasons.append(f'💥 Vol Dump ({vol_ratio:.1f}x)')
 
             if latest_1h['mfi'] < 20:
                 long_score += 1.5
@@ -571,12 +666,16 @@ class AdvancedDayTradingScanner:
                 short_score += 1
 
             # ── DETERMINE SIGNAL ─────────────────────────────────────
-            min_threshold = max_score * 0.48   # slightly lower since OBs add conviction
+            min_threshold = max_score * 0.48
 
             signal = None
             ob_active = None
 
             if long_score > short_score and long_score >= min_threshold:
+                # HARD GATE: volume must confirm direction
+                if not long_vol_ok:
+                    logger.info(f"⛔ {symbol} LONG blocked — no buy volume confirmation (buy%={buy_pct:.0f})")
+                    return None
                 signal  = 'LONG'
                 score   = long_score
                 reasons = long_reasons
@@ -590,6 +689,10 @@ class AdvancedDayTradingScanner:
                     quality = 'GOOD ✅'
 
             elif short_score > long_score and short_score >= min_threshold:
+                # HARD GATE: volume must confirm direction
+                if not short_vol_ok:
+                    logger.info(f"⛔ {symbol} SHORT blocked — no sell volume confirmation (buy%={buy_pct:.0f})")
+                    return None
                 signal  = 'SHORT'
                 score   = short_score
                 reasons = short_reasons
@@ -650,8 +753,10 @@ class AdvancedDayTradingScanner:
                     'reward_ratios': rr,
                     'risk_percent': risk_pct,
                     'reasons': reasons[:12],
-                    'ob_zone': ob_active,           # NEW
-                    'ob_type': ob_type_1h,          # NEW
+                    'ob_zone': ob_active,
+                    'ob_type': ob_type_1h,
+                    'buy_pct': buy_pct,          # volume direction %
+                    'vol_ratio': vol_ratio,       # activity vs avg
                     'tp_hit': [False, False, False],
                     'sl_hit': False,
                     'timestamp': datetime.now(),
@@ -702,7 +807,15 @@ class AdvancedDayTradingScanner:
             ob = sig['ob_zone']
             msg += f"🧱 <b>OB Zone:</b>  {fmt(ob['bottom'])} – {fmt(ob['top'])}\n\n"
 
-        msg += f"💰 <b>Entry</b>       {fmt(entry)}\n\n"
+        msg += f"💰 <b>Entry</b>       {fmt(entry)}\n"
+
+        # Volume confidence bar
+        buy_pct   = sig.get('buy_pct', 50)
+        vol_ratio = sig.get('vol_ratio', 1.0)
+        vol_filled = int(buy_pct / 10) if is_long else int((100 - buy_pct) / 10)
+        vol_bar    = "🟦" * vol_filled + "⬜" * (10 - vol_filled)
+        vol_label  = f"{buy_pct:.0f}% buy pressure" if is_long else f"{100-buy_pct:.0f}% sell pressure"
+        msg += f"📊 <b>Volume</b>      {vol_bar}  <i>{vol_label}  ({vol_ratio:.1f}x avg)</i>\n\n"
 
         msg += f"🎯 <b>TP 1</b>  →  <code>{fmt(tp1)}</code>  <i>(+{pct(tp1):.1f}%  •  RR {rr1:.1f}x)</i>\n"
         msg += f"🎯 <b>TP 2</b>  →  <code>{fmt(tp2)}</code>  <i>(+{pct(tp2):.1f}%  •  RR {rr2:.1f}x)</i>\n"
