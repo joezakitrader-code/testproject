@@ -25,69 +25,108 @@ def detect_order_blocks(df, lookback=50, swing_strength=3):
     """
     Detect Bullish and Bearish Order Blocks using SMC logic.
 
-    Bullish OB  = last BEARISH candle before a strong bullish impulse that
-                  broke a recent swing high.
-    Bearish OB  = last BULLISH candle before a strong bearish impulse that
-                  broke a recent swing low.
+    Improved filters (reduces weak/false OBs):
+      - Require impulse size > 1.5× ATR (no tiny moves)
+      - Require impulse closes beyond prior swing by ≥ 0.5 ATR
+      - Prefer OBs after a liquidity sweep (wick beyond prior swing then reversal)
 
     Returns a list of dicts:
         {'type': 'bullish'|'bearish',
          'top': float, 'bottom': float,
          'index': int,           # bar index in df
-         'mitigated': bool}
+         'mitigated': bool,
+         'strength': float}      # impulse size in ATR units
     """
     obs = []
 
-    highs = df['high'].values
-    lows  = df['low'].values
-    opens = df['open'].values
+    highs  = df['high'].values
+    lows   = df['low'].values
+    opens  = df['open'].values
     closes = df['close'].values
-    n = len(df)
+    n      = len(df)
 
     if n < lookback + swing_strength * 2:
         return obs
 
+    # ATR estimate (14-period simple)
+    atr_window = min(14, n - 1)
+    tr_vals = [max(highs[i] - lows[i],
+                   abs(highs[i] - closes[i-1]),
+                   abs(lows[i]  - closes[i-1]))
+               for i in range(1, n)]
+    atr = float(np.mean(tr_vals[-atr_window:]))
+    if atr == 0:
+        return obs
+
+    min_impulse  = 1.5 * atr   # impulse must be at least 1.5× ATR
+    min_close_ext = 0.5 * atr  # impulse close must extend ≥ 0.5 ATR beyond swing
+
     start = max(swing_strength, n - lookback)
 
     for i in range(start, n - swing_strength):
-        # ── BULLISH OB ──────────────────────────────────────────────
-        # Look for a bearish candle followed by a bullish impulse that
-        # clears the swing high from before the bearish candle.
-        if closes[i] < opens[i]:                          # bearish candle
-            # Impulse: next `swing_strength` candles are mostly bullish
-            impulse_high = max(highs[i+1 : i+1+swing_strength])
+
+        # ── BULLISH OB ──────────────────────────────────────────────────
+        if closes[i] < opens[i]:   # bearish candle — potential bullish OB
+            impulse_high  = max(highs[i+1 : i+1+swing_strength])
+            impulse_close = max(closes[i+1 : i+1+swing_strength])
             prior_swing_high = max(highs[max(0, i-swing_strength) : i])
 
-            if impulse_high > prior_swing_high:            # broke swing high → valid OB
-                ob = {
-                    'type': 'bullish',
-                    'top': max(opens[i], closes[i]),
-                    'bottom': min(opens[i], closes[i]),
-                    'index': i,
-                    'mitigated': False
-                }
-                obs.append(ob)
+            impulse_size = impulse_high - lows[i]
 
-        # ── BEARISH OB ──────────────────────────────────────────────
-        elif closes[i] > opens[i]:                        # bullish candle
-            impulse_low  = min(lows[i+1 : i+1+swing_strength])
+            # Gate 1: impulse must be large enough
+            if impulse_size < min_impulse:
+                continue
+            # Gate 2: impulse close must break prior swing by meaningful margin
+            if impulse_close < prior_swing_high + min_close_ext:
+                continue
+
+            # Bonus: check for liquidity sweep (wick below recent low then reverse)
+            prior_low = min(lows[max(0, i-swing_strength) : i])
+            swept_liq = lows[i] < prior_low   # wick below → sweep of sell-side liq
+
+            ob = {
+                'type':     'bullish',
+                'top':      max(opens[i], closes[i]),
+                'bottom':   min(opens[i], closes[i]),
+                'index':    i,
+                'mitigated': False,
+                'strength': impulse_size / atr,
+                'swept_liq': swept_liq,
+            }
+            obs.append(ob)
+
+        # ── BEARISH OB ──────────────────────────────────────────────────
+        elif closes[i] > opens[i]:  # bullish candle — potential bearish OB
+            impulse_low   = min(lows[i+1 : i+1+swing_strength])
+            impulse_close = min(closes[i+1 : i+1+swing_strength])
             prior_swing_low = min(lows[max(0, i-swing_strength) : i])
 
-            if impulse_low < prior_swing_low:              # broke swing low → valid OB
-                ob = {
-                    'type': 'bearish',
-                    'top': max(opens[i], closes[i]),
-                    'bottom': min(opens[i], closes[i]),
-                    'index': i,
-                    'mitigated': False
-                }
-                obs.append(ob)
+            impulse_size = highs[i] - impulse_low
 
-    # ── Mark mitigated OBs (price already traded through them) ──────
+            if impulse_size < min_impulse:
+                continue
+            if impulse_close > prior_swing_low - min_close_ext:
+                continue
+
+            prior_high   = max(highs[max(0, i-swing_strength) : i])
+            swept_liq    = highs[i] > prior_high
+
+            ob = {
+                'type':     'bearish',
+                'top':      max(opens[i], closes[i]),
+                'bottom':   min(opens[i], closes[i]),
+                'index':    i,
+                'mitigated': False,
+                'strength': impulse_size / atr,
+                'swept_liq': swept_liq,
+            }
+            obs.append(ob)
+
+    # ── Mark mitigated OBs ──────────────────────────────────────────────
     current_price = closes[-1]
     for ob in obs:
         if ob['type'] == 'bullish' and current_price < ob['bottom']:
-            ob['mitigated'] = True   # price went below, OB invalidated
+            ob['mitigated'] = True
         elif ob['type'] == 'bearish' and current_price > ob['top']:
             ob['mitigated'] = True
 
@@ -122,6 +161,278 @@ def price_at_order_block(current_price, obs, tolerance=0.003):
                 best_type = ob['type']
 
     return best_type, best
+
+
+# ─────────────────────────────────────────────
+#  SMART MONEY CONCEPTS MODULE (LuxAlgo port)
+# ─────────────────────────────────────────────
+
+def detect_swing_points(df, swing_length=5):
+    """
+    Detect swing highs and lows using pivot logic (same as LuxAlgo leg() function).
+    Returns arrays of (index, price) for swing highs and lows.
+    """
+    highs  = df['high'].values
+    lows   = df['low'].values
+    n      = len(df)
+    s      = swing_length
+
+    swing_highs = []   # list of (bar_index, price)
+    swing_lows  = []
+
+    for i in range(s, n - s):
+        # Swing high: highest in window centered on i
+        if highs[i] == max(highs[i-s : i+s+1]):
+            swing_highs.append((i, highs[i]))
+        # Swing low: lowest in window centered on i
+        if lows[i] == min(lows[i-s : i+s+1]):
+            swing_lows.append((i, lows[i]))
+
+    return swing_highs, swing_lows
+
+
+def detect_bos_choch(df, swing_length=5):
+    """
+    Detect Break of Structure (BOS) and Change of Character (CHoCH).
+
+    BOS   = price breaks a swing high/low in the SAME direction as the trend
+            → trend continuation confirmation
+    CHoCH = price breaks a swing high/low AGAINST the current trend
+            → potential trend reversal
+
+    Returns dict:
+        last_bos_bull   : last bullish BOS bar index (or None)
+        last_bos_bear   : last bearish BOS bar index
+        last_choch_bull : last bullish CHoCH bar index
+        last_choch_bear : last bearish CHoCH bar index
+        swing_trend     : 'bullish' | 'bearish' | 'neutral'
+        recent_bull_structure : bool — bullish BOS or CHoCH in last 10 bars
+        recent_bear_structure : bool — bearish BOS or CHoCH in last 10 bars
+    """
+    closes = df['close'].values
+    n      = len(df)
+
+    swing_highs, swing_lows = detect_swing_points(df, swing_length)
+
+    if not swing_highs or not swing_lows:
+        return {
+            'last_bos_bull': None, 'last_bos_bear': None,
+            'last_choch_bull': None, 'last_choch_bear': None,
+            'swing_trend': 'neutral',
+            'recent_bull_structure': False,
+            'recent_bear_structure': False,
+        }
+
+    # Track trend using HH/HL or LH/LL logic
+    swing_trend = 'neutral'
+    last_bos_bull = last_bos_bear = None
+    last_choch_bull = last_choch_bear = None
+
+    # Determine trend from last two swing highs and lows
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        if swing_highs[-1][1] > swing_highs[-2][1] and swing_lows[-1][1] > swing_lows[-2][1]:
+            swing_trend = 'bullish'   # HH + HL
+        elif swing_highs[-1][1] < swing_highs[-2][1] and swing_lows[-1][1] < swing_lows[-2][1]:
+            swing_trend = 'bearish'   # LH + LL
+
+    # Check last swing high/low for BOS or CHoCH
+    # Bullish break = close crosses ABOVE a swing high
+    last_sh_idx, last_sh_price = swing_highs[-1]
+    last_sl_idx, last_sl_price = swing_lows[-1]
+
+    # Scan recent bars for crossovers
+    lookback = min(20, n - 1)
+    for i in range(n - lookback, n):
+        # Bullish structure break (close crosses above last swing high)
+        if closes[i] > last_sh_price and (i == 0 or closes[i-1] <= last_sh_price):
+            if swing_trend == 'bearish':
+                last_choch_bull = i    # reversal
+            else:
+                last_bos_bull   = i    # continuation
+
+        # Bearish structure break (close crosses below last swing low)
+        if closes[i] < last_sl_price and (i == 0 or closes[i-1] >= last_sl_price):
+            if swing_trend == 'bullish':
+                last_choch_bear = i    # reversal
+            else:
+                last_bos_bear   = i    # continuation
+
+    recent_cutoff = n - 10
+    recent_bull_structure = (
+        (last_bos_bull   is not None and last_bos_bull   >= recent_cutoff) or
+        (last_choch_bull is not None and last_choch_bull >= recent_cutoff)
+    )
+    recent_bear_structure = (
+        (last_bos_bear   is not None and last_bos_bear   >= recent_cutoff) or
+        (last_choch_bear is not None and last_choch_bear >= recent_cutoff)
+    )
+
+    return {
+        'last_bos_bull':        last_bos_bull,
+        'last_bos_bear':        last_bos_bear,
+        'last_choch_bull':      last_choch_bull,
+        'last_choch_bear':      last_choch_bear,
+        'swing_trend':          swing_trend,
+        'recent_bull_structure': recent_bull_structure,
+        'recent_bear_structure': recent_bear_structure,
+    }
+
+
+def detect_fair_value_gaps(df, min_gap_pct=0.001):
+    """
+    Detect Fair Value Gaps (FVG) — 3-candle imbalance pattern from LuxAlgo SMC.
+
+    Bullish FVG : candle[2].low > candle[0].high  (gap up — price left a hole)
+    Bearish FVG : candle[2].high < candle[0].low  (gap down)
+
+    Only unmitigated FVGs (price hasn't filled them yet) are returned.
+
+    Returns:
+        bull_fvgs : list of {'top': float, 'bottom': float, 'index': int}
+        bear_fvgs : list of {'top': float, 'bottom': float, 'index': int}
+        nearest_bull_fvg : closest unmitigated bullish FVG to current price
+        nearest_bear_fvg : closest unmitigated bearish FVG to current price
+    """
+    highs  = df['high'].values
+    lows   = df['low'].values
+    closes = df['close'].values
+    n      = len(df)
+
+    bull_fvgs = []
+    bear_fvgs = []
+
+    for i in range(2, n):
+        # Bullish FVG: gap between candle[i-2] high and candle[i] low
+        if lows[i] > highs[i-2]:
+            gap_size = (lows[i] - highs[i-2]) / highs[i-2]
+            if gap_size >= min_gap_pct:
+                bull_fvgs.append({
+                    'top':    lows[i],
+                    'bottom': highs[i-2],
+                    'mid':    (lows[i] + highs[i-2]) / 2,
+                    'index':  i,
+                })
+
+        # Bearish FVG: gap between candle[i] high and candle[i-2] low
+        if highs[i] < lows[i-2]:
+            gap_size = (lows[i-2] - highs[i]) / lows[i-2]
+            if gap_size >= min_gap_pct:
+                bear_fvgs.append({
+                    'top':    lows[i-2],
+                    'bottom': highs[i],
+                    'mid':    (lows[i-2] + highs[i]) / 2,
+                    'index':  i,
+                })
+
+    # Filter mitigated FVGs (price has traded into them)
+    current_price = closes[-1]
+
+    active_bull = [f for f in bull_fvgs if current_price > f['bottom']]  # not fully filled
+    active_bear = [f for f in bear_fvgs if current_price < f['top']]
+
+    # Nearest to current price
+    nearest_bull = min(active_bull, key=lambda f: abs(current_price - f['mid']), default=None) if active_bull else None
+    nearest_bear = min(active_bear, key=lambda f: abs(current_price - f['mid']), default=None) if active_bear else None
+
+    return {
+        'bull_fvgs':      active_bull[-5:],   # keep last 5
+        'bear_fvgs':      active_bear[-5:],
+        'nearest_bull':   nearest_bull,
+        'nearest_bear':   nearest_bear,
+    }
+
+
+def detect_premium_discount(df):
+    """
+    Premium / Discount / Equilibrium zones from LuxAlgo SMC.
+
+    Uses trailing swing high and low (same as LuxAlgo drawPremiumDiscountZones):
+      Premium    = top 5% of range  → SELL zone (short bias)
+      Equilibrium= middle 5% band   → neutral / reversal watch
+      Discount   = bottom 5%        → BUY zone (long bias)
+
+    Returns:
+        zone           : 'premium' | 'discount' | 'equilibrium' | 'neutral'
+        range_pct      : how far price is through the range (0=bottom, 100=top)
+        swing_high     : trailing swing high
+        swing_low      : trailing swing low
+    """
+    highs  = df['high'].values
+    lows   = df['low'].values
+
+    swing_high = highs.max()
+    swing_low  = lows.min()
+    rng        = swing_high - swing_low
+
+    if rng == 0:
+        return {'zone': 'neutral', 'range_pct': 50, 'swing_high': swing_high, 'swing_low': swing_low}
+
+    current = df['close'].iloc[-1]
+    range_pct = (current - swing_low) / rng * 100
+
+    if range_pct >= 95:
+        zone = 'premium'        # top 5% — short zone
+    elif range_pct <= 5:
+        zone = 'discount'       # bottom 5% — long zone
+    elif 47.5 <= range_pct <= 52.5:
+        zone = 'equilibrium'    # mid 5% — watch for reversal
+    else:
+        zone = 'neutral'
+
+    return {
+        'zone':       zone,
+        'range_pct':  range_pct,
+        'swing_high': swing_high,
+        'swing_low':  swing_low,
+    }
+
+
+def detect_equal_highs_lows(df, length=3, threshold_atr_mult=0.1):
+    """
+    Equal Highs (EQH) and Equal Lows (EQL) — liquidity pools / stop hunt zones.
+
+    Two swing points are 'equal' if their prices are within threshold ATR of each other.
+    These mark where stop losses cluster → smart money hunts them.
+
+    Returns:
+        eqh : list of price levels with equal highs
+        eql : list of price levels with equal lows
+        nearest_eqh : closest EQH above current price (liquidity above)
+        nearest_eql : closest EQL below current price (liquidity below)
+    """
+    highs  = df['high'].values
+    lows   = df['low'].values
+    closes = df['close'].values
+    n      = len(df)
+
+    # Simple ATR estimate
+    atr = np.mean([abs(highs[i] - lows[i]) for i in range(max(0, n-14), n)])
+    threshold = threshold_atr_mult * atr
+
+    swing_highs, swing_lows = detect_swing_points(df, length)
+
+    eqh = []
+    for i in range(len(swing_highs) - 1):
+        for j in range(i+1, len(swing_highs)):
+            if abs(swing_highs[i][1] - swing_highs[j][1]) < threshold:
+                eqh.append(round((swing_highs[i][1] + swing_highs[j][1]) / 2, 8))
+
+    eql = []
+    for i in range(len(swing_lows) - 1):
+        for j in range(i+1, len(swing_lows)):
+            if abs(swing_lows[i][1] - swing_lows[j][1]) < threshold:
+                eql.append(round((swing_lows[i][1] + swing_lows[j][1]) / 2, 8))
+
+    current = closes[-1]
+    nearest_eqh = min([h for h in eqh if h > current], default=None) if eqh else None
+    nearest_eql = max([l for l in eql if l < current], default=None) if eql else None
+
+    return {
+        'eqh':         sorted(set(eqh)),
+        'eql':         sorted(set(eql)),
+        'nearest_eqh': nearest_eqh,
+        'nearest_eql': nearest_eql,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -162,22 +473,56 @@ class AdvancedDayTradingScanner:
         self.is_scanning = False
         self.is_tracking = False
 
+        # ── Dynamic universe ──────────────────────────────────────────────
+        self._universe_cache: list  = []          # top-N pairs by volume
+        self._universe_ts: datetime = datetime.min # last time we rebuilt it
+        self._watchlist: set        = set()        # pairs with recent/near signals
+        self._near_miss_ts: dict    = {}           # symbol → last near-miss time
+
     async def get_all_usdt_pairs(self):
-        try:
-            await self.exchange.load_markets()
-            tickers = await self.exchange.fetch_tickers()
-            pairs = []
-            for symbol in self.exchange.symbols:
-                if symbol.endswith('/USDT:USDT') and 'PERP' not in symbol:
-                    ticker = tickers.get(symbol)
-                    if ticker and ticker.get('quoteVolume', 0) > 1000000:
-                        pairs.append(symbol)
-            sorted_pairs = sorted(pairs, key=lambda x: tickers.get(x, {}).get('quoteVolume', 0), reverse=True)
-            logger.info(f"✅ Found {len(sorted_pairs)} high-quality pairs")
-            return sorted_pairs
-        except Exception as e:
-            logger.error(f"Error fetching pairs: {e}")
-            return []
+        """
+        Dynamic universe: top-60 by 24h volume, rebuilt every 4 hours.
+        Normal scan uses watchlist (up to 25 hot pairs) + top-20.
+        Full scan (every 4h) rebuilds the whole universe.
+        """
+        now = datetime.now()
+        rebuild_needed = (now - self._universe_ts).total_seconds() > 4 * 3600
+
+        if rebuild_needed:
+            try:
+                await self.exchange.load_markets()
+                tickers = await self.exchange.fetch_tickers()
+                pairs = []
+                for symbol in self.exchange.symbols:
+                    if symbol.endswith('/USDT:USDT') and 'PERP' not in symbol:
+                        ticker = tickers.get(symbol)
+                        if ticker and ticker.get('quoteVolume', 0) > 5_000_000:
+                            pairs.append(symbol)
+
+                sorted_pairs = sorted(
+                    pairs,
+                    key=lambda x: tickers.get(x, {}).get('quoteVolume', 0),
+                    reverse=True
+                )[:60]   # top 60 only
+
+                self._universe_cache = sorted_pairs
+                self._universe_ts    = now
+                logger.info(f"✅ Universe rebuilt: {len(sorted_pairs)} pairs")
+            except Exception as e:
+                logger.error(f"Error fetching pairs: {e}")
+                if not self._universe_cache:
+                    return []
+
+        # Scan order: watchlist first, then top-20 from universe
+        active_watchlist = [p for p in self._watchlist if p in self._universe_cache]
+        top20 = self._universe_cache[:20]
+        combined = list(dict.fromkeys(active_watchlist + top20))  # deduplicated, order preserved
+
+        # If it's a full rebuild cycle, scan the whole universe
+        if rebuild_needed:
+            return self._universe_cache
+
+        return combined
 
     async def fetch_day_trading_data(self, symbol):
         timeframes = {'1h': 100, '4h': 100, '15m': 50}
@@ -213,107 +558,188 @@ class AdvancedDayTradingScanner:
             return pd.Series([0] * len(df), index=df.index)
 
     def calculate_advanced_indicators(self, df):
+        """
+        Core indicators only — 7 essential signals with real edge.
+        Removed: StochRSI, Williams %R, UO, CCI, Aroon, ROC, MFI, CMF,
+                 OBV+EMA, Bollinger %B, Keltner, Donchian, PSAR, divergence,
+                 engulfing patterns (too noisy, ~0.5–1.5 pts each = overfitting)
+        Kept: EMA9/21/50, SuperTrend, RSI(14), ATR, VWAP, MACD histogram, ADX+DI, Volume
+        """
         try:
             if len(df) < 30:
                 return df
 
+            # ── TREND: EMA stack + SuperTrend ───────────────────────────
             df['ema_9']  = ta.trend.EMAIndicator(df['close'], window=9).ema_indicator()
             df['ema_21'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
             df['ema_50'] = ta.trend.EMAIndicator(df['close'], window=min(50, len(df)-1)).ema_indicator()
             df['supertrend'] = self.calculate_supertrend(df)
 
-            psar = ta.trend.PSARIndicator(df['high'], df['low'], df['close'])
-            df['psar'] = psar.psar()
-
-            df['rsi']   = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-            df['rsi_6'] = ta.momentum.RSIIndicator(df['close'], window=6).rsi()
-
-            stoch_rsi = ta.momentum.StochRSIIndicator(df['close'])
-            df['stoch_rsi_k'] = stoch_rsi.stochrsi_k()
-            df['stoch_rsi_d'] = stoch_rsi.stochrsi_d()
+            # ── MOMENTUM: RSI(14) + MACD histogram ──────────────────────
+            df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
 
             macd = ta.trend.MACD(df['close'])
             df['macd']        = macd.macd()
             df['macd_signal'] = macd.macd_signal()
             df['macd_hist']   = macd.macd_diff()
 
-            stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'])
-            df['stoch_k'] = stoch.stoch()
-            df['stoch_d'] = stoch.stoch_signal()
-
-            df['williams_r'] = ta.momentum.WilliamsRIndicator(df['high'], df['low'], df['close']).williams_r()
-            df['roc'] = ta.momentum.ROCIndicator(df['close'], window=12).roc()
-            df['uo']  = ta.momentum.UltimateOscillator(df['high'], df['low'], df['close']).ultimate_oscillator()
-
-            bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-            df['bb_upper']  = bb.bollinger_hband()
-            df['bb_middle'] = bb.bollinger_mavg()
-            df['bb_lower']  = bb.bollinger_lband()
-            df['bb_width']  = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-            df['bb_pband']  = bb.bollinger_pband()
-
-            kc = ta.volatility.KeltnerChannel(df['high'], df['low'], df['close'])
-            df['kc_upper'] = kc.keltner_channel_hband()
-            df['kc_lower'] = kc.keltner_channel_lband()
-
+            # ── VOLATILITY: ATR (used for SL/TP + volatility filter) ────
             df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
 
-            dc = ta.volatility.DonchianChannel(df['high'], df['low'], df['close'])
-            df['dc_upper'] = dc.donchian_channel_hband()
-            df['dc_lower'] = dc.donchian_channel_lband()
-
+            # ── VOLUME ───────────────────────────────────────────────────
             df['volume_sma']   = df['volume'].rolling(window=20).mean()
             df['volume_ratio'] = df['volume'] / df['volume_sma']
 
-            df['obv']     = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
-            df['obv_ema'] = df['obv'].ewm(span=20).mean()
-            df['mfi']     = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
-            df['ad']      = ta.volume.AccDistIndexIndicator(df['high'], df['low'], df['close'], df['volume']).acc_dist_index()
-            df['cmf']     = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
-
+            # ── TREND STRENGTH: ADX + DI ─────────────────────────────────
             adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
             df['adx']      = adx.adx()
             df['di_plus']  = adx.adx_pos()
             df['di_minus'] = adx.adx_neg()
 
-            df['cci'] = ta.trend.CCIIndicator(df['high'], df['low'], df['close']).cci()
-
-            aroon = ta.trend.AroonIndicator(df['high'], df['low'])
-            df['aroon_up']   = aroon.aroon_up()
-            df['aroon_down'] = aroon.aroon_down()
-            df['aroon_ind']  = df['aroon_up'] - df['aroon_down']
-
+            # ── VWAP ─────────────────────────────────────────────────────
             typical_price = (df['high'] + df['low'] + df['close']) / 3
             df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
             df['vwap'] = df['vwap'].fillna(df['close'])
-
-            df['bullish_candle'] = (df['close'] > df['open']).astype(int)
-            df['bullish_engulfing'] = (
-                (df['close'].shift(1) < df['open'].shift(1)) &
-                (df['close'] > df['open']) &
-                (df['open'] <= df['close'].shift(1)) &
-                (df['close'] >= df['open'].shift(1))
-            ).astype(int)
-            df['bearish_engulfing'] = (
-                (df['close'].shift(1) > df['open'].shift(1)) &
-                (df['close'] < df['open']) &
-                (df['open'] >= df['close'].shift(1)) &
-                (df['close'] <= df['open'].shift(1))
-            ).astype(int)
-
-            df['bullish_divergence'] = (
-                (df['low'] < df['low'].shift(1)) &
-                (df['rsi'] > df['rsi'].shift(1))
-            ).astype(int)
-            df['bearish_divergence'] = (
-                (df['high'] > df['high'].shift(1)) &
-                (df['rsi'] < df['rsi'].shift(1))
-            ).astype(int)
 
             return df
         except Exception as e:
             logger.error(f"Indicator error: {e}")
             return df
+
+    def calculate_volume_profile(self, df, n_rows=25):
+        """
+        Volume Profile ported from LuxAlgo Money Flow Profile.
+
+        For each price row (bucket) across the lookback window we calculate:
+          - total_vol  : total volume traded at that price level
+          - bull_vol   : buying volume (bar polarity: close > open)
+          - bear_vol   : selling volume
+          - sentiment  : bull_vol - bear_vol (positive = buyer dominated)
+
+        From those we derive:
+          poc_price    : Point of Control — price row with most volume (magnet)
+          htn_levels   : High Traded Nodes (>53% of max) — consolidation / S&R
+          ltn_levels   : Low Traded Nodes (<37% of max)  — supply/demand gaps
+          poc_sentiment: is the POC buyer or seller dominated?
+          current_node : which node type is current price sitting in?
+          current_sent : sentiment at current price level (bull or bear)
+
+        Returns a dict with all of the above.
+        """
+        try:
+            if len(df) < 10:
+                return None
+
+            highs   = df['high'].values
+            lows    = df['low'].values
+            closes  = df['close'].values
+            opens   = df['open'].values
+            volumes = df['volume'].values
+
+            p_low  = lows.min()
+            p_high = highs.max()
+            if p_high <= p_low:
+                return None
+
+            step = (p_high - p_low) / n_rows
+
+            total_vol = np.zeros(n_rows)
+            bull_vol  = np.zeros(n_rows)   # close > open (buying bar)
+            bear_vol  = np.zeros(n_rows)   # close <= open (selling bar)
+
+            for i in range(len(df)):
+                v    = volumes[i]
+                is_bull = closes[i] > opens[i]
+
+                for row in range(n_rows):
+                    row_low  = p_low + row * step
+                    row_high = row_low + step
+
+                    # Skip if bar doesn't touch this row
+                    if highs[i] < row_low or lows[i] >= row_high:
+                        continue
+
+                    # Proportion of bar that overlaps with this row (LuxAlgo vPOR logic)
+                    bar_range = highs[i] - lows[i]
+                    if bar_range == 0:
+                        por = 1.0
+                    elif lows[i] >= row_low and highs[i] > row_high:
+                        por = (row_high - lows[i]) / bar_range
+                    elif highs[i] <= row_high and lows[i] < row_low:
+                        por = (highs[i] - row_low) / bar_range
+                    elif lows[i] >= row_low and highs[i] <= row_high:
+                        por = 1.0
+                    else:
+                        por = step / bar_range
+
+                    allocated = v * por
+                    total_vol[row] += allocated
+                    if is_bull:
+                        bull_vol[row] += allocated
+                    else:
+                        bear_vol[row] += allocated
+
+            max_vol = total_vol.max()
+            if max_vol == 0:
+                return None
+
+            poc_row   = int(np.argmax(total_vol))
+            poc_price = p_low + (poc_row + 0.5) * step
+
+            # Classify rows exactly like LuxAlgo thresholds (53% / 37%)
+            htn_levels = []   # High Traded Nodes
+            ltn_levels = []   # Low Traded Nodes
+            for row in range(n_rows):
+                ratio = total_vol[row] / max_vol
+                mid   = p_low + (row + 0.5) * step
+                if ratio >= 0.53:
+                    htn_levels.append(mid)
+                elif ratio <= 0.37:
+                    ltn_levels.append(mid)
+
+            # POC sentiment
+            poc_sentiment = 'bullish' if bull_vol[poc_row] >= bear_vol[poc_row] else 'bearish'
+
+            # Current price context
+            current_price = closes[-1]
+            current_row   = min(int((current_price - p_low) / step), n_rows - 1)
+            current_row   = max(current_row, 0)
+
+            cur_ratio = total_vol[current_row] / max_vol
+            if cur_ratio >= 0.53:
+                current_node = 'high'       # consolidation — expect mean reversion
+            elif cur_ratio <= 0.37:
+                current_node = 'low'        # thin air — expect fast move
+            else:
+                current_node = 'average'
+
+            current_sent = 'bullish' if bull_vol[current_row] >= bear_vol[current_row] else 'bearish'
+
+            # Nearest HTN above and below (act as dynamic S/R)
+            htn_above = [h for h in htn_levels if h > current_price]
+            htn_below = [h for h in htn_levels if h < current_price]
+            nearest_resistance = min(htn_above) if htn_above else None
+            nearest_support    = max(htn_below) if htn_below else None
+
+            return {
+                'poc_price':          poc_price,
+                'poc_sentiment':      poc_sentiment,
+                'htn_levels':         htn_levels,
+                'ltn_levels':         ltn_levels,
+                'current_node':       current_node,
+                'current_sentiment':  current_sent,
+                'nearest_resistance': nearest_resistance,
+                'nearest_support':    nearest_support,
+                'total_vol':          total_vol,
+                'bull_vol':           bull_vol,
+                'bear_vol':           bear_vol,
+                'p_low':              p_low,
+                'step':               step,
+                'n_rows':             n_rows,
+            }
+        except Exception as e:
+            logger.error(f"Volume profile error: {e}")
+            return None
 
     def detect_volume_spike(self, df):
         """Legacy spike check — kept for backward compat, used internally."""
@@ -393,22 +819,31 @@ class AdvancedDayTradingScanner:
                 else:
                     short_conviction += 1
 
-        # Decision gates
+        # Decision gates — stricter thresholds (was 55%/45%, 0.8x)
         long_vol_ok = (
-            buy_pct > 55 and
-            vol_ratio > 0.8 and
-            (vol_rising or long_conviction >= 2) and
-            not (buy_pct < 45 and vol_fading)
+            buy_pct >= 62 and          # was 55 — require clear buying dominance
+            vol_ratio >= 1.4 and       # was 0.8 — require above-average volume
+            long_conviction >= 1 and   # at least 1 conviction candle
+            not (buy_pct < 50 and vol_fading)
         )
 
         short_vol_ok = (
-            buy_pct < 45 and
-            vol_ratio > 0.8 and
-            (vol_rising or short_conviction >= 2) and
-            not (buy_pct > 55 and vol_fading)
+            buy_pct <= 38 and          # was 45
+            vol_ratio >= 1.4 and       # was 0.8
+            short_conviction >= 1 and
+            not (buy_pct > 50 and vol_fading)
         )
 
         return long_vol_ok, short_vol_ok, vol_ratio, buy_pct
+
+    def _near_miss(self, symbol: str, direction: str):
+        """Log near-miss and add pair to priority watchlist for next scan cycle."""
+        now = datetime.now()
+        last = self._near_miss_ts.get(symbol)
+        if last is None or (now - last).total_seconds() > 3600:   # debounce 1h
+            self._near_miss_ts[symbol] = now
+            self._watchlist.add(symbol)
+            logger.info(f"📋 Near-miss watchlist: {symbol} ({direction}) — will prioritise next scan")
 
     def detect_signal(self, data, symbol):
         try:
@@ -430,280 +865,252 @@ class AdvancedDayTradingScanner:
             latest_4h  = df_4h.iloc[-1]
             latest_15m = df_15m.iloc[-1]
 
-            required_cols = ['ema_9', 'ema_21', 'rsi', 'macd', 'vwap', 'bb_pband']
+            required_cols = ['ema_9', 'ema_21', 'rsi', 'macd', 'vwap', 'atr']
             for col in required_cols:
                 if col not in latest_1h.index or pd.isna(latest_1h[col]):
                     return None
 
-            volume_spike, vol_ratio = self.detect_volume_spike(df_1h)
-            long_vol_ok, short_vol_ok, vol_ratio, buy_pct = self.analyze_volume_direction(df_1h, lookback=6)
+            volume_spike, vol_ratio_spike = self.detect_volume_spike(df_1h)
+
+            # ── VOLUME PROFILE (LuxAlgo logic) ───────────────────────
+            vp = self.calculate_volume_profile(df_1h, n_rows=25)
+
+            # ── SMC: BOS / CHoCH / FVG / Premium-Discount / EQH-EQL ─
+            smc_struct = detect_bos_choch(df_1h,  swing_length=5)
+            smc_fvg    = detect_fair_value_gaps(df_1h, min_gap_pct=0.001)
+            smc_pd     = detect_premium_discount(df_1h)
+            smc_eq     = detect_equal_highs_lows(df_1h, length=3)
 
             # ── ORDER BLOCK DETECTION ────────────────────────────────
-            # Detect on 1H (primary) and 4H (higher timeframe confirmation)
+            # (Used in Stage 2; detection happens inside the staging block)
             obs_1h = detect_order_blocks(df_1h,  lookback=60, swing_strength=3)
             obs_4h = detect_order_blocks(df_4h,  lookback=60, swing_strength=3)
 
             current_price = latest_15m['close']
 
-            ob_type_1h, ob_1h = price_at_order_block(current_price, obs_1h, tolerance=0.003)
-            ob_type_4h, ob_4h = price_at_order_block(current_price, obs_4h, tolerance=0.004)
-
             # ─────────────────────────────────────────────────────────
 
-            long_score  = 0
-            short_score = 0
-            max_score   = 40          # increased from 35 → 40 (5 pts for OBs)
-            long_reasons  = []
-            short_reasons = []
+            # ══════════════════════════════════════════════════════════
+            # STAGE 0 — SESSION & VOLATILITY HARD FILTERS
+            # Block low-liquidity sessions and extreme volatility
+            # ══════════════════════════════════════════════════════════
+            utc_hour = datetime.utcnow().hour
+            # Block 00:00–06:00 UTC (Asian range, low liquidity most days)
+            if 0 <= utc_hour < 6:
+                logger.info(f"⛔ {symbol} blocked — low liquidity session ({utc_hour}:xx UTC)")
+                return None
 
-            # ── ORDER BLOCK SCORING (5 pts new) ─────────────────────
-            ob_tag_long  = None
-            ob_tag_short = None
+            # Block extreme volatility: ATR > 3× its 100-bar average
+            recent_atr = latest_1h['atr']
+            atr_series = df_1h['atr'].dropna()
+            if len(atr_series) >= 20:
+                atr_avg = atr_series.iloc[-min(100, len(atr_series)):].mean()
+                if recent_atr > 3.0 * atr_avg:
+                    logger.info(f"⛔ {symbol} blocked — extreme volatility (ATR {recent_atr:.5f} > 3× avg {atr_avg:.5f})")
+                    return None
 
-            if ob_type_1h == 'bullish':
-                long_score += 3
-                ob_tag_long = f"🧱 1H Bullish OB [{ob_1h['bottom']:.4f}–{ob_1h['top']:.4f}]"
-                long_reasons.append(ob_tag_long)
+            # ══════════════════════════════════════════════════════════
+            # STAGE 1 — MUST-PASS GATES (trend + volume + zone)
+            # All three must pass for a signal to proceed.
+            # ══════════════════════════════════════════════════════════
 
-            elif ob_type_1h == 'bearish':
-                short_score += 3
-                ob_tag_short = f"🧱 1H Bearish OB [{ob_1h['bottom']:.4f}–{ob_1h['top']:.4f}]"
-                short_reasons.append(ob_tag_short)
+            long_vol_ok, short_vol_ok, vol_ratio, buy_pct = self.analyze_volume_direction(df_1h, lookback=6)
 
-            if ob_type_4h == 'bullish':
-                long_score += 2
-                long_reasons.append(f"🏗️ 4H Bullish OB Confirmed")
+            # 1a. Determine dominant 4H trend from EMA stack
+            ema9_4h  = latest_4h.get('ema_9',  0)
+            ema21_4h = latest_4h.get('ema_21', 0)
+            ema50_4h = latest_4h.get('ema_50', 0)
+            trend_long  = ema9_4h > ema21_4h > ema50_4h
+            trend_short = ema9_4h < ema21_4h < ema50_4h
 
-            elif ob_type_4h == 'bearish':
-                short_score += 2
-                short_reasons.append(f"🏗️ 4H Bearish OB Confirmed")
+            # Also check 1H EMA alignment
+            ema9_1h  = latest_1h.get('ema_9',  0)
+            ema21_1h = latest_1h.get('ema_21', 0)
+            st_long  = latest_1h['close'] > latest_1h.get('supertrend', 0)
+            st_short = latest_1h['close'] < latest_1h.get('supertrend', float('inf'))
 
-            # ── TREND (6 pts) ────────────────────────────────────────
-            if latest_4h['ema_9'] > latest_4h['ema_21'] > latest_4h['ema_50']:
-                long_score += 3
-                long_reasons.append('🔥 4H Uptrend')
-            elif latest_4h['ema_9'] < latest_4h['ema_21'] < latest_4h['ema_50']:
-                short_score += 3
-                short_reasons.append('🔥 4H Downtrend')
+            # 1b. Premium/Discount zone filter (hard block wrong zone)
+            if smc_pd['zone'] == 'premium' and (trend_long or ema9_1h > ema21_1h):
+                logger.info(f"⛔ {symbol} LONG blocked — price in PREMIUM zone ({smc_pd['range_pct']:.0f}%)")
+                return None
+            if smc_pd['zone'] == 'discount' and (trend_short or ema9_1h < ema21_1h):
+                logger.info(f"⛔ {symbol} SHORT blocked — price in DISCOUNT zone ({smc_pd['range_pct']:.0f}%)")
+                return None
 
-            if latest_1h['ema_9'] > latest_1h['ema_21']:
-                long_score += 2
-                long_reasons.append('1H Bullish')
-            elif latest_1h['ema_9'] < latest_1h['ema_21']:
-                short_score += 2
-                short_reasons.append('1H Bearish')
+            # Determine trade direction from Stage 1 gates
+            long_s1  = (trend_long or (ema9_1h > ema21_1h and st_long)) and long_vol_ok and smc_pd['zone'] != 'premium'
+            short_s1 = (trend_short or (ema9_1h < ema21_1h and st_short)) and short_vol_ok and smc_pd['zone'] != 'discount'
 
-            if latest_1h['close'] > latest_1h['supertrend']:
-                long_score += 1
-                long_reasons.append('SuperTrend Bull')
-            elif latest_1h['close'] < latest_1h['supertrend']:
-                short_score += 1
-                short_reasons.append('SuperTrend Bear')
+            if not long_s1 and not short_s1:
+                logger.info(f"⛔ {symbol} — failed Stage 1 gates (trend/volume/zone)")
+                return None
 
-            # ── MOMENTUM (9 pts) ─────────────────────────────────────
-            if latest_1h['rsi'] < 30:
-                long_score += 3.5
-                long_reasons.append(f'💎 RSI Deep Oversold ({latest_1h["rsi"]:.0f})')
-            elif latest_1h['rsi'] < 40:
-                long_score += 2
-                long_reasons.append(f'RSI Oversold ({latest_1h["rsi"]:.0f})')
-            elif 40 <= latest_1h['rsi'] <= 50:
-                long_score += 1
-                long_reasons.append('RSI Buy Zone')
+            # ══════════════════════════════════════════════════════════
+            # STAGE 2 — STRUCTURE (need at least ONE of these)
+            # Unmitigated OB retest  OR  recent BOS/CHoCH  OR  FVG retest
+            # ══════════════════════════════════════════════════════════
+            cp = current_price  # already set above
 
-            if latest_1h['rsi'] > 70:
-                short_score += 3.5
-                short_reasons.append(f'💎 RSI Deep Overbought ({latest_1h["rsi"]:.0f})')
-            elif latest_1h['rsi'] > 60:
-                short_score += 2
-                short_reasons.append(f'RSI Overbought ({latest_1h["rsi"]:.0f})')
-            elif 50 <= latest_1h['rsi'] <= 60:
-                short_score += 1
-                short_reasons.append('RSI Sell Zone')
+            # OB hit (1H primary, 4H for confirmation bonus)
+            ob_type_1h, ob_1h = price_at_order_block(cp, obs_1h, tolerance=0.003)
+            ob_type_4h, ob_4h = price_at_order_block(cp, obs_4h, tolerance=0.004)
 
-            if latest_1h['stoch_rsi_k'] < 0.2 and latest_1h['stoch_rsi_k'] > latest_1h['stoch_rsi_d']:
-                long_score += 2
-                long_reasons.append('⚡ Stoch RSI Cross')
-            elif latest_1h['stoch_rsi_k'] > 0.8 and latest_1h['stoch_rsi_k'] < latest_1h['stoch_rsi_d']:
-                short_score += 2
-                short_reasons.append('⚡ Stoch RSI Cross')
+            # BOS/CHoCH
+            bull_struct = smc_struct['recent_bull_structure']
+            bear_struct = smc_struct['recent_bear_structure']
 
-            if latest_1h['macd'] > latest_1h['macd_signal'] and prev_1h['macd'] <= prev_1h['macd_signal']:
-                long_score += 2.5
-                long_reasons.append('🎯 MACD Cross')
-            elif latest_1h['macd'] < latest_1h['macd_signal'] and prev_1h['macd'] >= prev_1h['macd_signal']:
-                short_score += 2.5
-                short_reasons.append('🎯 MACD Cross')
+            # FVG retest (within 0.8% of FVG midpoint — tighter than before)
+            bull_fvg_retest = (
+                smc_fvg['nearest_bull'] is not None and
+                abs(cp - smc_fvg['nearest_bull']['mid']) / cp < 0.008
+            )
+            bear_fvg_retest = (
+                smc_fvg['nearest_bear'] is not None and
+                abs(cp - smc_fvg['nearest_bear']['mid']) / cp < 0.008
+            )
 
-            if latest_1h['uo'] < 30:
-                long_score += 1.5
-                long_reasons.append('UO Oversold')
-            elif latest_1h['uo'] > 70:
-                short_score += 1.5
-                short_reasons.append('UO Overbought')
+            long_s2  = (ob_type_1h == 'bullish') or bull_struct or bull_fvg_retest
+            short_s2 = (ob_type_1h == 'bearish') or bear_struct or bear_fvg_retest
 
-            # ── VOLUME (5 pts) ───────────────────────────────────────
-            # Directional volume — only score in the right direction
-            if long_vol_ok:
-                long_score += 3
-                long_reasons.append(f'📈 Buy Vol Confirmed ({buy_pct:.0f}% buying, {vol_ratio:.1f}x avg)')
-            if short_vol_ok:
-                short_score += 3
-                short_reasons.append(f'📉 Sell Vol Confirmed ({100-buy_pct:.0f}% selling, {vol_ratio:.1f}x avg)')
+            if long_s1 and not long_s2:
+                # Near-miss logging for watchlist
+                self._near_miss(symbol, 'LONG')
+                logger.info(f"📋 {symbol} LONG near-miss — Stage 2 fail (no OB/BOS/FVG structure)")
+                return None
+            if short_s1 and not short_s2:
+                self._near_miss(symbol, 'SHORT')
+                logger.info(f"📋 {symbol} SHORT near-miss — Stage 2 fail (no OB/BOS/FVG structure)")
+                return None
 
-            # Extra spike bonus — still valid but only when direction matches
-            if volume_spike:
-                if latest_1h['close'] > prev_1h['close'] and long_vol_ok:
-                    long_score += 1
-                    long_reasons.append(f'🚀 Vol Spike ({vol_ratio:.1f}x)')
-                elif latest_1h['close'] < prev_1h['close'] and short_vol_ok:
-                    short_score += 1
-                    short_reasons.append(f'💥 Vol Dump ({vol_ratio:.1f}x)')
-
-            if latest_1h['mfi'] < 20:
-                long_score += 1.5
-                long_reasons.append(f'MFI Oversold ({latest_1h["mfi"]:.0f})')
-            elif latest_1h['mfi'] > 80:
-                short_score += 1.5
-                short_reasons.append(f'MFI Overbought ({latest_1h["mfi"]:.0f})')
-
-            if latest_1h['cmf'] > 0.15:
-                long_score += 1
-                long_reasons.append('Strong Buying (CMF)')
-            elif latest_1h['cmf'] < -0.15:
-                short_score += 1
-                short_reasons.append('Strong Selling (CMF)')
-
-            obv_trend = df_1h['obv'].iloc[-5:].diff().mean()
-            if obv_trend > 0 and latest_1h['obv'] > latest_1h['obv_ema']:
-                long_score += 0.5
-                long_reasons.append('OBV Accumulation')
-            elif obv_trend < 0 and latest_1h['obv'] < latest_1h['obv_ema']:
-                short_score += 0.5
-                short_reasons.append('OBV Distribution')
-
-            # ── VOLATILITY (6 pts) ───────────────────────────────────
-            if latest_1h['bb_pband'] < 0.1:
-                long_score += 2.5
-                long_reasons.append('💎 Lower BB')
-            elif latest_1h['bb_pband'] > 0.9:
-                short_score += 2.5
-                short_reasons.append('💎 Upper BB')
-
-            if latest_1h['cci'] < -150:
-                long_score += 1.5
-                long_reasons.append('CCI Deep Oversold')
-            elif latest_1h['cci'] > 150:
-                short_score += 1.5
-                short_reasons.append('CCI Deep Overbought')
-
-            if latest_1h['williams_r'] < -85:
-                long_score += 1
-                long_reasons.append('Williams Oversold')
-            elif latest_1h['williams_r'] > -15:
-                short_score += 1
-                short_reasons.append('Williams Overbought')
-
-            if latest_1h['close'] < latest_1h['vwap'] * 0.98:
-                long_score += 1
-                long_reasons.append('Below VWAP')
-            elif latest_1h['close'] > latest_1h['vwap'] * 1.02:
-                short_score += 1
-                short_reasons.append('Above VWAP')
-
-            # ── TREND STRENGTH (4 pts) ───────────────────────────────
-            if latest_1h['adx'] > 30:
-                if latest_1h['di_plus'] > latest_1h['di_minus']:
-                    long_score += 2
-                    long_reasons.append(f'🔥 Strong Up (ADX:{latest_1h["adx"]:.0f})')
+            # Resolve direction when both pass (prefer the one with stronger structure)
+            if long_s1 and long_s2 and short_s1 and short_s2:
+                # Tiebreak: 4H trend
+                if trend_long:
+                    short_s1 = False
+                elif trend_short:
+                    long_s1 = False
                 else:
-                    short_score += 2
-                    short_reasons.append(f'🔥 Strong Down (ADX:{latest_1h["adx"]:.0f})')
-            elif latest_1h['adx'] > 25:
-                if latest_1h['di_plus'] > latest_1h['di_minus']:
-                    long_score += 1
-                else:
-                    short_score += 1
+                    return None   # ambiguous — skip
 
-            if latest_1h['aroon_ind'] > 50:
-                long_score += 1
-                long_reasons.append('Aroon Up')
-            elif latest_1h['aroon_ind'] < -50:
-                short_score += 1
-                short_reasons.append('Aroon Down')
+            signal_dir = 'LONG' if (long_s1 and long_s2) else 'SHORT'
 
-            if latest_1h['roc'] > 3:
-                long_score += 1
-                long_reasons.append('Strong Momentum')
-            elif latest_1h['roc'] < -3:
-                short_score += 1
-                short_reasons.append('Strong Momentum')
+            # ══════════════════════════════════════════════════════════
+            # STAGE 3 — CONFLUENCE COUNT → quality tier
+            # Count strong confluences; assign Elite/High/Normal
+            # ══════════════════════════════════════════════════════════
+            confluences = 0
+            reasons     = []
 
-            # ── DIVERGENCE & PATTERNS (3 pts) ────────────────────────
-            if latest_1h['bullish_divergence'] == 1:
-                long_score += 2
-                long_reasons.append('🎯 Bullish Divergence')
-            elif latest_1h['bearish_divergence'] == 1:
-                short_score += 2
-                short_reasons.append('🎯 Bearish Divergence')
+            is_long = signal_dir == 'LONG'
 
-            if latest_15m['bullish_engulfing'] == 1:
-                long_score += 1.5
-                long_reasons.append('📊 Bullish Engulfing')
-            elif latest_15m['bearish_engulfing'] == 1:
-                short_score += 1.5
-                short_reasons.append('📊 Bearish Engulfing')
+            # Confluence 1: 4H full EMA stack alignment
+            if (is_long and trend_long) or (not is_long and trend_short):
+                confluences += 1
+                reasons.append('🔥 4H EMA Stack Aligned')
 
-            # ── HTF CONFIRMATION (2 pts) ─────────────────────────────
-            if latest_4h['close'] > latest_4h['vwap']:
-                long_score += 1
+            # Confluence 2: 1H EMA + SuperTrend alignment
+            if is_long and ema9_1h > ema21_1h and st_long:
+                confluences += 1
+                reasons.append('1H Bullish EMA + SuperTrend')
+            elif not is_long and ema9_1h < ema21_1h and not st_long:
+                confluences += 1
+                reasons.append('1H Bearish EMA + SuperTrend')
+
+            # Confluence 3: RSI in favourable zone
+            rsi = latest_1h['rsi']
+            if is_long and rsi < 40:
+                confluences += 1
+                reasons.append(f'💎 RSI Oversold ({rsi:.0f})')
+            elif is_long and 40 <= rsi <= 55:
+                reasons.append(f'RSI Buy Zone ({rsi:.0f})')
+            elif not is_long and rsi > 60:
+                confluences += 1
+                reasons.append(f'💎 RSI Overbought ({rsi:.0f})')
+            elif not is_long and 45 <= rsi <= 60:
+                reasons.append(f'RSI Sell Zone ({rsi:.0f})')
+
+            # Confluence 4: ADX confirms strong trend
+            adx_val = latest_1h.get('adx', 0)
+            di_plus  = latest_1h.get('di_plus', 0)
+            di_minus = latest_1h.get('di_minus', 0)
+            if adx_val > 30 and ((is_long and di_plus > di_minus) or (not is_long and di_minus > di_plus)):
+                confluences += 1
+                reasons.append(f'🔥 Strong Trend ADX ({adx_val:.0f})')
+
+            # Confluence 5: Order Block (1H) hit
+            if (is_long and ob_type_1h == 'bullish') or (not is_long and ob_type_1h == 'bearish'):
+                confluences += 1
+                ob_active = ob_1h
+                reasons.append(f"🧱 1H {'Bullish' if is_long else 'Bearish'} OB [{ob_1h['bottom']:.4f}–{ob_1h['top']:.4f}]")
             else:
-                short_score += 1
+                ob_active = None
 
-            if latest_4h['rsi'] < 50:
-                long_score += 1
-            elif latest_4h['rsi'] > 50:
-                short_score += 1
+            # Confluence 6: 4H OB confirmation bonus
+            if (is_long and ob_type_4h == 'bullish') or (not is_long and ob_type_4h == 'bearish'):
+                confluences += 1
+                reasons.append(f"🏗️ 4H OB Confirmed")
+                if ob_active is None:
+                    ob_active = ob_4h
 
-            # ── DETERMINE SIGNAL ─────────────────────────────────────
-            min_threshold = max_score * 0.48
+            # Confluence 7: BOS/CHoCH structure
+            if (is_long and bull_struct) or (not is_long and bear_struct):
+                confluences += 1
+                tag = ('BOS' if (smc_struct['last_bos_bull'] if is_long else smc_struct['last_bos_bear'])
+                       else 'CHoCH')
+                reasons.append(f"⚡ {'Bullish' if is_long else 'Bearish'} {tag}")
 
-            signal = None
-            ob_active = None
+            # Confluence 8: FVG retest
+            if (is_long and bull_fvg_retest) or (not is_long and bear_fvg_retest):
+                confluences += 1
+                fvg = smc_fvg['nearest_bull'] if is_long else smc_fvg['nearest_bear']
+                reasons.append(f"🟩 FVG Retest ({fvg['bottom']:.4f}–{fvg['top']:.4f})" if is_long
+                               else f"🟥 FVG Retest ({fvg['bottom']:.4f}–{fvg['top']:.4f})")
 
-            if long_score > short_score and long_score >= min_threshold:
-                # HARD GATE: volume must confirm direction
-                if not long_vol_ok:
-                    logger.info(f"⛔ {symbol} LONG blocked — no buy volume confirmation (buy%={buy_pct:.0f})")
-                    return None
-                signal  = 'LONG'
-                score   = long_score
-                reasons = long_reasons
-                ob_active = ob_1h if ob_type_1h == 'bullish' else None
+            # Confluence 9: Discount/Premium zone alignment
+            if (is_long and smc_pd['zone'] == 'discount') or (not is_long and smc_pd['zone'] == 'premium'):
+                confluences += 1
+                reasons.append(f"{'💚 Discount' if is_long else '🔴 Premium'} Zone ({smc_pd['range_pct']:.0f}%)")
 
-                if long_score >= max_score * 0.70:
-                    quality = 'PREMIUM 💎'
-                elif long_score >= max_score * 0.58:
-                    quality = 'HIGH 🔥'
-                else:
-                    quality = 'GOOD ✅'
+            # Confluence 10: Volume Profile Low Node (fast move likely)
+            if vp and vp['current_node'] == 'low':
+                if (is_long and vp['current_sentiment'] == 'bullish') or \
+                   (not is_long and vp['current_sentiment'] == 'bearish'):
+                    confluences += 1
+                    reasons.append(f"🔵 VP Low Node — fast move likely")
 
-            elif short_score > long_score and short_score >= min_threshold:
-                # HARD GATE: volume must confirm direction
-                if not short_vol_ok:
-                    logger.info(f"⛔ {symbol} SHORT blocked — no sell volume confirmation (buy%={buy_pct:.0f})")
-                    return None
-                signal  = 'SHORT'
-                score   = short_score
-                reasons = short_reasons
-                ob_active = ob_1h if ob_type_1h == 'bearish' else None
+            # Confluence 11: MACD histogram momentum
+            macd_hist = latest_1h.get('macd_hist', 0)
+            prev_macd_hist = df_1h['macd_hist'].iloc[-2] if 'macd_hist' in df_1h.columns else 0
+            if is_long and macd_hist > 0 and macd_hist > prev_macd_hist:
+                reasons.append('MACD Rising')
+            elif not is_long and macd_hist < 0 and macd_hist < prev_macd_hist:
+                reasons.append('MACD Falling')
 
-                if short_score >= max_score * 0.70:
-                    quality = 'PREMIUM 💎'
-                elif short_score >= max_score * 0.58:
-                    quality = 'HIGH 🔥'
-                else:
-                    quality = 'GOOD ✅'
+            # Confluence 12: VWAP relationship
+            vwap_val = latest_1h.get('vwap', cp)
+            if is_long and cp < vwap_val * 0.99:
+                reasons.append('Below VWAP')
+            elif not is_long and cp > vwap_val * 1.01:
+                reasons.append('Above VWAP')
+
+            # ── Assign quality tier ───────────────────────────────────────
+            if confluences >= 4:
+                quality = 'PREMIUM 💎'
+            elif confluences >= 2:
+                quality = 'HIGH 🔥'
+            elif confluences >= 1:
+                quality = 'GOOD ✅'
+            else:
+                # 0 confluences even after passing 2 stages — very weak, skip
+                self._near_miss(symbol, signal_dir)
+                return None
+
+            # Keep score variables for stats/compat
+            score     = confluences
+            max_score = 12
+
+            signal = signal_dir
+
 
             if signal:
                 entry = latest_15m['close']
@@ -726,9 +1133,24 @@ class AdvancedDayTradingScanner:
                         sl = entry + (atr * 1.5)
 
                 if signal == 'LONG':
-                    targets = [entry + (atr * 1), entry + (atr * 2), entry + (atr * 3.5)]
+                    tp1 = entry + (atr * 1)
+                    # If POC is above entry and between ATR*1.5 and ATR*3, use it as TP2
+                    tp2 = entry + (atr * 2)
+                    tp3 = entry + (atr * 3.5)
+                    if vp and vp['poc_price'] > entry * 1.005:
+                        poc_dist = vp['poc_price'] - entry
+                        if atr * 1.2 < poc_dist < atr * 3.5:
+                            tp2 = vp['poc_price']
+                    targets = [tp1, tp2, tp3]
                 else:
-                    targets = [entry - (atr * 1), entry - (atr * 2), entry - (atr * 3.5)]
+                    tp1 = entry - (atr * 1)
+                    tp2 = entry - (atr * 2)
+                    tp3 = entry - (atr * 3.5)
+                    if vp and vp['poc_price'] < entry * 0.995:
+                        poc_dist = entry - vp['poc_price']
+                        if atr * 1.2 < poc_dist < atr * 3.5:
+                            tp2 = vp['poc_price']
+                    targets = [tp1, tp2, tp3]
 
                 risk_pct = abs((sl - entry) / entry * 100)
                 rr = [(abs(tp - entry) / abs(sl - entry)) for tp in targets]
@@ -746,7 +1168,8 @@ class AdvancedDayTradingScanner:
                     'quality': quality,
                     'score': score,
                     'max_score': max_score,
-                    'score_percent': (score / max_score) * 100,
+                    'score_percent': (score / max_score) * 100,   # confluences/12
+                    'confluences': confluences,
                     'entry': entry,
                     'stop_loss': sl,
                     'targets': targets,
@@ -755,8 +1178,25 @@ class AdvancedDayTradingScanner:
                     'reasons': reasons[:12],
                     'ob_zone': ob_active,
                     'ob_type': ob_type_1h,
-                    'buy_pct': buy_pct,          # volume direction %
-                    'vol_ratio': vol_ratio,       # activity vs avg
+                    'buy_pct': buy_pct,
+                    'vol_ratio': vol_ratio,
+                    'vp_poc': vp['poc_price'] if vp else None,
+                    'vp_node': vp['current_node'] if vp else None,
+                    'vp_support': vp['nearest_support'] if vp else None,
+                    'vp_resistance': vp['nearest_resistance'] if vp else None,
+                    'smc_trend':   smc_struct['swing_trend'],
+                    'smc_zone':    smc_pd['zone'],
+                    'smc_zone_pct': smc_pd['range_pct'],
+                    'smc_fvg_bull': smc_fvg['nearest_bull'],
+                    'smc_fvg_bear': smc_fvg['nearest_bear'],
+                    'smc_eqh':     smc_eq['nearest_eqh'],
+                    'smc_eql':     smc_eq['nearest_eql'],
+                    'smc_bos_choch': (
+                        'Bullish BOS'   if smc_struct['last_bos_bull']   else
+                        'Bullish CHoCH' if smc_struct['last_choch_bull'] else
+                        'Bearish BOS'   if smc_struct['last_bos_bear']   else
+                        'Bearish CHoCH' if smc_struct['last_choch_bear'] else None
+                    ),
                     'tp_hit': [False, False, False],
                     'sl_hit': False,
                     'timestamp': datetime.now(),
@@ -781,7 +1221,9 @@ class AdvancedDayTradingScanner:
             'GOOD ✅':    "✅ SIGNAL",
         }.get(sig['quality'], "✅ SIGNAL")
 
-        ob_badge = "  •  🧱 ORDER BLOCK" if sig.get('ob_zone') else ""
+        ob_badge  = "  •  🧱 OB"  if sig.get('ob_zone')  else ""
+        vp_badge  = "  •  📊 VP"  if sig.get('vp_poc')   else ""
+        smc_badge = "  •  🧠 SMC" if sig.get('smc_bos_choch') or sig.get('smc_zone') != 'neutral' else ""
 
         # Price formatting — strip trailing zeros nicely
         def fmt(p):
@@ -797,7 +1239,7 @@ class AdvancedDayTradingScanner:
 
         pct = lambda p: abs((p - entry) / entry * 100)
 
-        msg  = f"<b>{quality_line}{ob_badge}</b>\n"
+        msg  = f"<b>{quality_line}{ob_badge}{vp_badge}{smc_badge}</b>\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"  {dir_emoji} <b>#{sig['symbol']}USDT  •  {dir_label}</b>\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -805,7 +1247,46 @@ class AdvancedDayTradingScanner:
         # OB zone — one clean line
         if sig.get('ob_zone'):
             ob = sig['ob_zone']
-            msg += f"🧱 <b>OB Zone:</b>  {fmt(ob['bottom'])} – {fmt(ob['top'])}\n\n"
+            msg += f"🧱 <b>OB Zone:</b>  {fmt(ob['bottom'])} – {fmt(ob['top'])}\n"
+
+        # Volume Profile context
+        if sig.get('vp_poc'):
+            node_label = {
+                'high':    '🟡 Consolidation',
+                'low':     '⚡ Thin Air — fast move',
+                'average': '⚪ Average'
+            }.get(sig.get('vp_node'), '')
+            msg += f"📍 <b>VP POC:</b>  {fmt(sig['vp_poc'])}  <i>({node_label})</i>\n"
+            if sig.get('vp_support') and is_long:
+                msg += f"🟩 <b>VP Support:</b>  {fmt(sig['vp_support'])}\n"
+            if sig.get('vp_resistance') and not is_long:
+                msg += f"🟥 <b>VP Resist:</b>   {fmt(sig['vp_resistance'])}\n"
+
+        # SMC context line
+        smc_parts = []
+        if sig.get('smc_bos_choch'):
+            smc_parts.append(f"⚡ {sig['smc_bos_choch']}")
+        zone = sig.get('smc_zone', 'neutral')
+        zone_pct = sig.get('smc_zone_pct', 50)
+        if zone == 'discount':
+            smc_parts.append(f"💚 Discount Zone ({zone_pct:.0f}%)")
+        elif zone == 'premium':
+            smc_parts.append(f"🔴 Premium Zone ({zone_pct:.0f}%)")
+        elif zone == 'equilibrium':
+            smc_parts.append(f"⚖️ Equilibrium ({zone_pct:.0f}%)")
+        if is_long and sig.get('smc_fvg_bull'):
+            f = sig['smc_fvg_bull']
+            smc_parts.append(f"🟩 FVG {fmt(f['bottom'])}–{fmt(f['top'])}")
+        if not is_long and sig.get('smc_fvg_bear'):
+            f = sig['smc_fvg_bear']
+            smc_parts.append(f"🟥 FVG {fmt(f['bottom'])}–{fmt(f['top'])}")
+        if is_long and sig.get('smc_eqh'):
+            smc_parts.append(f"💧 EQH {fmt(sig['smc_eqh'])}")
+        if not is_long and sig.get('smc_eql'):
+            smc_parts.append(f"💧 EQL {fmt(sig['smc_eql'])}")
+        if smc_parts:
+            msg += f"🧠 <b>SMC:</b>  {' · '.join(smc_parts)}\n"
+        msg += "\n"
 
         msg += f"💰 <b>Entry</b>       {fmt(entry)}\n"
 
@@ -824,8 +1305,9 @@ class AdvancedDayTradingScanner:
         msg += f"🛑 <b>Stop Loss</b>  <code>{fmt(sl)}</code>  <i>(-{sig['risk_percent']:.1f}%)</i>\n\n"
 
         msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"⭐ Score  {sig['score']:.0f}/{sig['max_score']}   "
-        msg += f"{'▰' * int(sig['score_percent']/10)}{'▱' * (10 - int(sig['score_percent']/10))}\n"
+        confluences = sig.get('confluences', sig['score'])
+        conf_bar = '▰' * confluences + '▱' * (12 - confluences)
+        msg += f"⭐ Confluences  {confluences}/12   {conf_bar}\n"
         msg += f"🔍 <i>{' · '.join(r.lstrip('🔥💎🎯⚡🚀💥📊 ') for r in sig['reasons'][:5])}</i>\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"<i>⏰ {sig['timestamp'].strftime('%H:%M')}  •  📡 Live tracking on</i>"
@@ -988,6 +1470,9 @@ class AdvancedDayTradingScanner:
                         if sig['quality'] == 'PREMIUM 💎':
                             self.stats['premium_signals'] += 1
 
+                        # Keep this pair on watchlist after a signal
+                        self._watchlist.add(pair)
+
                         self.active_trades[sig['trade_id']] = sig
 
                         msg = self.format_signal(sig)
@@ -1102,18 +1587,20 @@ class AdvancedDayTradingScanner:
     async def run(self, interval=60):
         logger.info("🚀 ADVANCED DAY TRADING SCANNER")
 
-        welcome  = "🔥 <b>ADVANCED 24H DAY TRADING SCANNER</b> 🔥\n\n"
-        welcome += "✅ ALL USDT pairs\n"
-        welcome += "✅ 25+ indicators\n"
-        welcome += "✅ 🧱 Order Block detection (1H + 4H)\n"
-        welcome += "✅ Divergence detection\n"
-        welcome += "✅ Pattern recognition\n"
-        welcome += "✅ Live TP/SL tracking\n"
-        welcome += "✅ 40-point scoring\n\n"
-        welcome += f"Scans every {interval} min\n\n"
+        welcome  = "🔥 <b>ADVANCED 24H DAY TRADING SCANNER v2</b> 🔥\n\n"
+        welcome += "✅ Dynamic universe (top 60 pairs by volume)\n"
+        welcome += "✅ 3-Stage Filter: Trend → Structure → Confluence\n"
+        welcome += "✅ 🧱 Improved Order Block detection (1H + 4H)\n"
+        welcome += "✅ 📊 Volume Profile (LuxAlgo MFP)\n"
+        welcome += "✅ 🧠 Smart Money Concepts (BOS/CHoCH/FVG/Zones)\n"
+        welcome += "✅ Session + volatility hard filters\n"
+        welcome += "✅ Stricter volume gates (62%+ buy pressure, 1.4× avg)\n"
+        welcome += "✅ Near-miss watchlist — catches strengthening setups\n"
+        welcome += "✅ Live TP/SL tracking + 24H report\n\n"
+        welcome += f"Scans every {interval} min (watchlist priority)\n\n"
         welcome += "<b>Commands:</b>\n"
         welcome += "/scan /stats /trades /help\n\n"
-        welcome += "🎯 Advanced signals + Live alerts!"
+        welcome += "🎯 Quality over quantity — fewer but sharper signals!"
 
         await self.send_msg(welcome)
 
