@@ -1,43 +1,20 @@
 """
-SMC PRO SCANNER v5.0
+SMC PRO SCANNER v4.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ROOT CAUSE FIXES from v4.0:
-  PROBLEM 1: "Signal fires then reverses immediately"
-  → OB was 50% mitigated before trigger formed = entering a dead zone
-  → FIX: OB mitigation hard cap at 25% (was 50%)
-  → FIX: OB freshness check — OB must be < 40 candles old
-  → FIX: Price must be entering OB from the correct side, not exiting
+CHANGES from v3.2:
+  - Entry trigger moved 15M → 1H for higher accuracy signals
+  - 1H engulfing/pin/hammer now the primary trigger (was 15M)
+  - 15M kept only for volume spike confirmation bonus
+  - 1H trigger worth +25 pts (was +20) — reflects higher timeframe weight
+  - OB detection remains on 1H (unchanged)
+  - 4H HH/LL stays as +8 score bonus (not a hard gate)
+  - MIN_SCORE raised 72 → 75 (1H triggers are stronger, bar is higher)
+  - Scan stack: 4H trend → 1H structure + OB + trigger → 15M volume bonus
 
-  PROBLEM 2: "Signal fires too late (missed the move)"
-  → Previous-candle trigger was stale, entry 1-2H behind price
-  → FIX: Previous candle trigger cut to max +8pts (was +14)
-  → FIX: Added "OB approach velocity" — price must be moving INTO OB
-         not ranging inside it already for 3+ candles
-  → FIX: If price has been inside OB > 3 candles → skip (stale)
-
-  PROBLEM 3: Ranging/choppy market losses
-  → HH/LL was only a bonus, ADX was never checked as a gate
-  → FIX: 4H ADX < 18 = hard SKIP (pure chop, no edge)
-  → FIX: 4H ADX 18-22 = ranging penalty (-15 score)
-  → FIX: BTC dominance regime check — skip alts in BTC chop
-
-  PROBLEM 4: Wrong trend direction entries  
-  → 4H EMA check was too loose (21>50 alone = +10 pts)
-  → FIX: Must confirm with DI+ > DI- for LONG, DI- > DI+ for SHORT
-  → FIX: 4H price must be above/below both EMA 21 AND 50 for full pts
-  → FIX: Counter-trend trades need BOTH MSS + sweep (not just one)
-
-  ADDITIONAL UPGRADES:
-  → ATR-adaptive SL: minimum 1.2x ATR (was 0.2x — way too tight)
-  → OB quality score now checks vol at OB formation (was price only)
-  → Near-miss debug shows EXACT reason score fell short
-  → MIN_SCORE raised 75 → 80 (tighter gates earn it)
-  → Scan skips pairs with spread > 0.15% (avoids illiquid noise)
-
-TIMEFRAME ROLES v5.0:
-  4H  → Trend bias (EMA + ADX gate) + HH/LL + BTC regime
-  1H  → BOS/MSS + Fresh OB (≤40 bars, ≤25% mitigated) + Entry trigger
-  15M → Volume spike bonus only (unchanged)
+TIMEFRAME ROLES v4.0:
+  4H  → Trend bias (EMA) + HH/LL structure depth
+  1H  → BOS/MSS + Order Block zone + Entry trigger candle  ← KEY CHANGE
+  15M → Volume spike bonus only
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -62,23 +39,15 @@ warnings.filterwarnings('ignore')
 # ═══════════════════════════════════════════════
 #  TUNABLE SETTINGS
 # ═══════════════════════════════════════════════
-MAX_SIGNALS_PER_SCAN  = 5        # reduced from 6 — quality over quantity
-MIN_SCORE             = 80       # raised from 75
-MIN_VOLUME_24H        = 8_000_000  # raised from 5M — better liquidity
-OB_TOLERANCE_PCT      = 0.006    # slightly tighter
-OB_IMPULSE_ATR_MULT   = 1.2      # stronger impulse required (was 1.0)
-OB_MAX_AGE_BARS       = 40       # NEW: OB older than 40x1H bars = skip
-OB_MAX_MITIGATION_PCT = 0.25     # NEW: OB >25% mitigated = skip (was 50%)
-OB_MAX_CANDLES_INSIDE = 3        # NEW: price inside OB >3 candles = stale
+MAX_SIGNALS_PER_SCAN  = 6
+MIN_SCORE             = 75       # raised from 72 — 1H triggers are stronger
+MIN_VOLUME_24H        = 5_000_000
+OB_TOLERANCE_PCT      = 0.008
+OB_IMPULSE_ATR_MULT   = 1.0
 STRUCTURE_LOOKBACK    = 20
 SCAN_INTERVAL_MIN     = 30
 HH_LL_LOOKBACK        = 10
 HH_LL_BONUS           = 8
-ADX_CHOP_HARD_GATE    = 18       # NEW: 4H ADX below this = skip entirely
-ADX_RANGE_PENALTY     = 15       # NEW: 4H ADX 18-22 = score penalty
-ADX_RANGE_THRESHOLD   = 22       # NEW: above this = trending, no penalty
-ATR_SL_MINIMUM_MULT   = 1.2      # NEW: SL must be at least 1.2x ATR away
-MAX_SPREAD_PCT        = 0.0015   # NEW: skip pairs with spread > 0.15%
 
 
 # ══════════════════════════════════════════════════════════════
@@ -128,7 +97,7 @@ def add_indicators(df):
         uw   = df['high'] - df[['open','close']].max(axis=1)
         lw   = df[['open','close']].min(axis=1) - df['low']
 
-        # ── Trigger candles (1H) ──────────────────────────────
+        # ── Trigger candles (now used on 1H) ──────────────────
         df['bull_engulf'] = (
             (df['close'].shift(1) < df['open'].shift(1)) &
             (df['close'] > df['open']) &
@@ -165,7 +134,7 @@ def add_indicators(df):
 
 
 # ══════════════════════════════════════════════════════════════
-#  SMC ENGINE v5.0
+#  SMC ENGINE
 # ══════════════════════════════════════════════════════════════
 
 class SMCEngine:
@@ -198,40 +167,6 @@ class SMCEngine:
             if rl < pl:
                 return True,  f"📉 4H Lower Low ({pl:.5f} → {rl:.5f}) +{HH_LL_BONUS}pts"
             return False, f"➖ 4H no LL ({rl:.5f} ≥ {pl:.5f}) — ranging"
-
-    def check_adx_regime(self, df_4h):
-        """
-        NEW v5.0: Hard gate on 4H ADX.
-        Returns (regime, adx_value, message)
-        regime: 'TRENDING' | 'RANGING' | 'CHOP'
-        """
-        adx = df_4h['adx'].iloc[-1]
-        if pd.isna(adx):
-            return 'UNKNOWN', 0, "⚠️ ADX not available"
-        if adx < ADX_CHOP_HARD_GATE:
-            return 'CHOP', adx, f"❌ 4H ADX {adx:.1f} < {ADX_CHOP_HARD_GATE} — pure chop, HARD SKIP"
-        elif adx < ADX_RANGE_THRESHOLD:
-            return 'RANGING', adx, f"⚠️ 4H ADX {adx:.1f} — ranging, -{ADX_RANGE_PENALTY}pts penalty"
-        else:
-            return 'TRENDING', adx, f"✅ 4H ADX {adx:.1f} — trending market"
-
-    def check_di_alignment(self, df_4h, direction):
-        """
-        NEW v5.0: DI+/DI- must confirm the bias direction.
-        Prevents entering longs in hidden downtrends and vice versa.
-        """
-        di_pos = df_4h['di_pos'].iloc[-1]
-        di_neg = df_4h['di_neg'].iloc[-1]
-        if pd.isna(di_pos) or pd.isna(di_neg):
-            return False, "⚠️ DI data unavailable"
-        if direction == 'LONG':
-            if di_pos > di_neg:
-                return True,  f"✅ DI+ ({di_pos:.1f}) > DI- ({di_neg:.1f}) — bull pressure"
-            return False, f"❌ DI- ({di_neg:.1f}) > DI+ ({di_pos:.1f}) — bear pressure in LONG"
-        else:
-            if di_neg > di_pos:
-                return True,  f"✅ DI- ({di_neg:.1f}) > DI+ ({di_pos:.1f}) — bear pressure"
-            return False, f"❌ DI+ ({di_pos:.1f}) > DI- ({di_neg:.1f}) — bull pressure in SHORT"
 
     def detect_structure_break(self, df, highs, lows, lookback=STRUCTURE_LOOKBACK):
         events = []
@@ -267,119 +202,44 @@ class SMCEngine:
         return latest
 
     def find_order_blocks(self, df, direction, lookback=60):
-        """
-        v5.0 CHANGES:
-        - Mitigation check raised from 50% to OB_MAX_MITIGATION_PCT (25%)
-        - Age check: OB must be within OB_MAX_AGE_BARS candles
-        - Volume at OB formation tracked for quality scoring
-        """
         obs = []
         n = len(df)
         start = max(2, n - lookback)
 
         for i in range(start, n - 3):
-            # Age gate: skip OBs too far back
-            age = (n - 1) - i
-            if age > OB_MAX_AGE_BARS:
-                continue
-
             c = df.iloc[i]
             atr_local = df['atr'].iloc[i] if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i]) else (c['high'] - c['low'])
             min_impulse = atr_local * OB_IMPULSE_ATR_MULT
-
-            # Volume at OB formation (relative to recent avg)
-            vol_at_ob = df['vol_ratio'].iloc[i] if 'vol_ratio' in df.columns and not pd.isna(df['vol_ratio'].iloc[i]) else 1.0
 
             if direction == 'LONG':
                 if c['close'] >= c['open']: continue
                 fwd_high = df['high'].iloc[i+1:min(i+5, n)].max()
                 if fwd_high - c['low'] < min_impulse: continue
-
-                ob_top    = max(c['open'], c['close'])
-                ob_bottom = c['low']
-                ob_range  = ob_top - ob_bottom
-
-                # v5.0: Strict mitigation check (25% max)
-                lowest_close_since = df['close'].iloc[i+1:n].min()
-                if ob_range > 0:
-                    mitigation = max(0, ob_top - lowest_close_since) / ob_range
-                    if mitigation > OB_MAX_MITIGATION_PCT:
-                        continue
-
-                obs.append({
-                    'top':       ob_top,
-                    'bottom':    ob_bottom,
-                    'mid':      (ob_top + ob_bottom) / 2,
-                    'bar':       i,
-                    'age':       age,
-                    'vol_ratio': vol_at_ob,
-                    'mitigation': mitigation if ob_range > 0 else 0
-                })
-
-            else:  # SHORT
+                ob = {
+                    'top':    max(c['open'], c['close']),
+                    'bottom': c['low'],
+                    'mid':   (max(c['open'], c['close']) + c['low']) / 2,
+                    'bar':    i
+                }
+                ob_50 = (ob['top'] + ob['bottom']) / 2
+                if (df['close'].iloc[i+1:n] < ob_50).any(): continue
+                obs.append(ob)
+            else:
                 if c['close'] <= c['open']: continue
                 fwd_low = df['low'].iloc[i+1:min(i+5, n)].min()
                 if c['high'] - fwd_low < min_impulse: continue
-
-                ob_top    = c['high']
-                ob_bottom = min(c['open'], c['close'])
-                ob_range  = ob_top - ob_bottom
-
-                # v5.0: Strict mitigation check (25% max)
-                highest_close_since = df['close'].iloc[i+1:n].max()
-                if ob_range > 0:
-                    mitigation = max(0, highest_close_since - ob_bottom) / ob_range
-                    if mitigation > OB_MAX_MITIGATION_PCT:
-                        continue
-
-                obs.append({
-                    'top':       ob_top,
-                    'bottom':    ob_bottom,
-                    'mid':      (ob_top + ob_bottom) / 2,
-                    'bar':       i,
-                    'age':       age,
-                    'vol_ratio': vol_at_ob,
-                    'mitigation': mitigation if ob_range > 0 else 0
-                })
+                ob = {
+                    'top':    c['high'],
+                    'bottom': min(c['open'], c['close']),
+                    'mid':   (c['high'] + min(c['open'], c['close'])) / 2,
+                    'bar':    i
+                }
+                ob_50 = (ob['top'] + ob['bottom']) / 2
+                if (df['close'].iloc[i+1:n] > ob_50).any(): continue
+                obs.append(ob)
 
         obs.sort(key=lambda x: x['bar'], reverse=True)
         return obs
-
-    def check_ob_approach(self, df, ob, direction, n_candles=OB_MAX_CANDLES_INSIDE):
-        """
-        NEW v5.0: Detects if price is freshly entering the OB vs ranging inside it.
-
-        'FRESH'  = price entered OB within last 1-2 candles  ← BEST
-        'RECENT' = price entered OB 3 candles ago             ← OK
-        'STALE'  = price has been inside OB for >3 candles   ← SKIP
-
-        Also checks approach direction (must come from the right side).
-        """
-        n = len(df)
-        closes = df['close'].iloc[-n_candles-3:]
-
-        # Count how many recent candles have been inside the OB
-        candles_inside = 0
-        for i in range(len(closes)-1, -1, -1):
-            p = closes.iloc[i]
-            if ob['bottom'] <= p <= ob['top']:
-                candles_inside += 1
-            else:
-                break  # as soon as we hit a candle outside, stop counting
-
-        if candles_inside > n_candles:
-            return 'STALE', candles_inside, f"❌ Price inside OB {candles_inside} candles — stale, skip"
-        elif candles_inside >= 2:
-            return 'RECENT', candles_inside, f"⚠️ Price entered OB {candles_inside} candles ago — OK"
-        else:
-            # Verify price came from the correct approach direction
-            prior_close = df['close'].iloc[-3] if len(df) >= 3 else df['close'].iloc[0]
-            if direction == 'LONG' and prior_close > ob['top']:
-                return 'FRESH', candles_inside, f"✅ Fresh OB approach from above (LONG)"
-            elif direction == 'SHORT' and prior_close < ob['bottom']:
-                return 'FRESH', candles_inside, f"✅ Fresh OB approach from below (SHORT)"
-            else:
-                return 'FRESH', candles_inside, f"✅ Fresh OB entry ({candles_inside} candle inside)"
 
     def price_in_ob(self, price, ob, tolerance_pct=OB_TOLERANCE_PCT):
         tol = ob['top'] * tolerance_pct
@@ -429,38 +289,20 @@ class SMCEngine:
         elif pos > 0.60: return 'PREMIUM',  pos
         return 'NEUTRAL', pos
 
-    def calculate_atr_sl(self, entry, ob, atr, direction):
-        """
-        NEW v5.0: ATR-adaptive SL.
-        SL = max(OB-based SL, entry ± 1.2x ATR)
-        Prevents wicked-out SLs on volatile alts.
-        """
-        min_distance = atr * ATR_SL_MINIMUM_MULT
-        if direction == 'LONG':
-            ob_sl = ob['bottom'] - atr * 0.3
-            atr_sl = entry - min_distance
-            sl = min(ob_sl, atr_sl)  # further away = safer
-        else:
-            ob_sl = ob['top'] + atr * 0.3
-            atr_sl = entry + min_distance
-            sl = max(ob_sl, atr_sl)  # further away = safer
-        return sl
-
 
 # ══════════════════════════════════════════════════════════════
-#  SCORER v5.0
+#  SCORER  (1H-based trigger, 15M volume bonus only)
 # ══════════════════════════════════════════════════════════════
 
-def score_setup(direction, ob, ob_approach, structure, sweep, fvg_near,
-                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed,
-                adx_regime, di_aligned):
+def score_setup(direction, ob, structure, sweep, fvg_near,
+                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed):
     score = 0
     reasons = []
     failed = []
 
-    l1  = df_1h.iloc[-1]
-    p1  = df_1h.iloc[-2]
-    l15 = df_15m.iloc[-1]
+    l1  = df_1h.iloc[-1]   # current 1H candle  ← ENTRY TRIGGER SOURCE
+    p1  = df_1h.iloc[-2]   # previous 1H candle
+    l15 = df_15m.iloc[-1]  # used for vol bonus only
     l4  = df_4h.iloc[-1]
 
     # ── 1. Structure (20 pts) ─────────────────────────────────
@@ -475,93 +317,45 @@ def score_setup(direction, ob, ob_approach, structure, sweep, fvg_near,
     # ── 2. Order Block quality (20 pts) ──────────────────────
     if ob:
         ob_size_pct = (ob['top'] - ob['bottom']) / ob['bottom'] * 100
-        # v5.0: Also factor in mitigation level and vol at formation
-        mit_pct = ob.get('mitigation', 0) * 100
-        vol_at_ob = ob.get('vol_ratio', 1.0)
-
-        base_ob_score = 0
         if ob_size_pct < 0.8:
-            base_ob_score = 20
-            reasons.append(f"📦 Tight OB ({ob_size_pct:.2f}%, mit:{mit_pct:.0f}%) — high quality")
+            score += 20; reasons.append(f"📦 Tight OB ({ob_size_pct:.2f}%) — high quality")
         elif ob_size_pct < 2.0:
-            base_ob_score = 13
-            reasons.append(f"📦 OB ({ob_size_pct:.2f}%, mit:{mit_pct:.0f}%)")
+            score += 13; reasons.append(f"📦 OB ({ob_size_pct:.2f}%)")
         else:
-            base_ob_score = 7
-            reasons.append(f"📦 Wide OB ({ob_size_pct:.2f}%) — lower quality")
-
-        # Bonus for high-volume OB formation (institutional activity)
-        if vol_at_ob >= 2.0:
-            base_ob_score = min(base_ob_score + 3, 20)
-            reasons.append(f"🔊 High-vol OB formation ({vol_at_ob:.1f}x avg)")
-
-        score += base_ob_score
+            score += 7;  reasons.append(f"📦 Wide OB ({ob_size_pct:.2f}%) — lower quality")
     else:
         failed.append("❌ No valid OB found")
 
-    # ── 3. OB Approach freshness (NEW — up to 8 pts, -10 if stale) ──
-    approach_status = ob_approach[0] if ob_approach else 'UNKNOWN'
-    if approach_status == 'FRESH':
-        score += 8
-        reasons.append(f"🆕 Fresh OB entry — price just arrived")
-    elif approach_status == 'RECENT':
-        score += 3
-        reasons.append(f"⏱ Recent OB entry ({ob_approach[1]} candles ago)")
-    elif approach_status == 'STALE':
-        score -= 10
-        failed.append(ob_approach[2])
-
-    # ── 4. 4H Trend Alignment (15 pts) ───────────────────────
+    # ── 3. 4H Trend Alignment (15 pts) ───────────────────────
     e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0); e200 = l4.get('ema_200', 0)
-    price = l1.get('close', 0)
-
     if direction == 'LONG':
-        if e21 > e50 > e200 and price > e50:
-            score += 15; reasons.append("📈 4H Triple EMA Bull Stack + price above")
-        elif e21 > e50 and price > e21:
-            score += 12; reasons.append("📈 4H EMA aligned + price above 21")
+        if e21 > e50 > e200:
+            score += 15; reasons.append("📈 4H Triple EMA Bull Stack")
         elif e21 > e50:
-            score += 8;  reasons.append("📈 4H EMA 21>50 Bull")
+            score += 10; reasons.append("📈 4H EMA 21>50 Bull")
         elif pd_label == 'DISCOUNT':
-            score += 5;  reasons.append("📈 4H Discount (counter-trend, low score)")
+            score += 6;  reasons.append("📈 4H Discount Zone (counter-trend OK)")
         else:
             failed.append("⚠️ 4H trend weak for LONG")
     else:
-        if e21 < e50 < e200 and price < e50:
-            score += 15; reasons.append("📉 4H Triple EMA Bear Stack + price below")
-        elif e21 < e50 and price < e21:
-            score += 12; reasons.append("📉 4H EMA aligned + price below 21")
+        if e21 < e50 < e200:
+            score += 15; reasons.append("📉 4H Triple EMA Bear Stack")
         elif e21 < e50:
-            score += 8;  reasons.append("📉 4H EMA 21<50 Bear")
+            score += 10; reasons.append("📉 4H EMA 21<50 Bear")
         elif pd_label == 'PREMIUM':
-            score += 5;  reasons.append("📉 4H Premium (counter-trend, low score)")
+            score += 6;  reasons.append("📉 4H Premium Zone (counter-trend OK)")
         else:
             failed.append("⚠️ 4H trend weak for SHORT")
 
-    # ── 5. ADX Regime (NEW — penalty for ranging) ────────────
-    if adx_regime == 'RANGING':
-        score -= ADX_RANGE_PENALTY
-        failed.append(f"⚠️ ADX ranging — applied -{ADX_RANGE_PENALTY}pts")
-    elif adx_regime == 'TRENDING':
-        score += 5
-        reasons.append(f"💪 ADX trending (+5pts)")
-
-    # ── 6. DI Alignment (NEW — 5 pts) ────────────────────────
-    if di_aligned:
-        score += 5
-        reasons.append("✅ DI aligned with bias")
-    else:
-        failed.append("⚠️ DI not aligned — opposing directional pressure")
-
-    # ── 7. 4H HH/LL Bonus (8 pts) ────────────────────────────
+    # ── 4. 4H HH/LL Bonus (8 pts) ────────────────────────────
     if hh_ll_confirmed:
         score += HH_LL_BONUS
         reasons.append(f"🏔️ 4H HH/LL confirmed (+{HH_LL_BONUS}pts)")
     else:
         failed.append(f"➖ 4H HH/LL not confirmed — ranging")
 
-    # ── 8. 1H Entry Trigger (25 pts) ─────────────────────────
-    # v5.0: Previous candle trigger reduced to max +8 (was +14)
+    # ── 5. 1H Entry Trigger (25 pts) ← UPGRADED FROM 15M ─────
+    # Now reading from 1H candles — much stronger signal weight
     trigger = False
     trigger_label = ""
 
@@ -576,14 +370,14 @@ def score_setup(direction, ob, ob_approach, structure, sweep, fvg_near,
             score += 18; trigger = True
             trigger_label = "🕯️ 1H Hammer ✅"
         elif p1.get('bull_engulf', 0) == 1:
-            score += 8; trigger = True   # ← reduced from 14
-            trigger_label = "🕯️ 1H Bull Engulf (prev — reduced weight) ⚠️"
+            score += 14; trigger = True
+            trigger_label = "🕯️ 1H Bull Engulf (prev candle) ✅"
         elif p1.get('bull_pin', 0) == 1:
-            score += 6; trigger = True   # ← reduced from 11
-            trigger_label = "🕯️ 1H Bull Pin (prev — reduced weight) ⚠️"
+            score += 11; trigger = True
+            trigger_label = "🕯️ 1H Bull Pin (prev candle) ✅"
         elif p1.get('hammer', 0) == 1:
-            score += 5; trigger = True   # ← reduced from 9
-            trigger_label = "🕯️ 1H Hammer (prev — reduced weight) ⚠️"
+            score += 9;  trigger = True
+            trigger_label = "🕯️ 1H Hammer (prev candle) ✅"
     else:
         if l1.get('bear_engulf', 0) == 1:
             score += 25; trigger = True
@@ -595,22 +389,22 @@ def score_setup(direction, ob, ob_approach, structure, sweep, fvg_near,
             score += 18; trigger = True
             trigger_label = "🕯️ 1H Shooting Star ✅"
         elif p1.get('bear_engulf', 0) == 1:
-            score += 8; trigger = True   # ← reduced from 14
-            trigger_label = "🕯️ 1H Bear Engulf (prev — reduced weight) ⚠️"
+            score += 14; trigger = True
+            trigger_label = "🕯️ 1H Bear Engulf (prev candle) ✅"
         elif p1.get('bear_pin', 0) == 1:
-            score += 6; trigger = True   # ← reduced from 11
-            trigger_label = "🕯️ 1H Bear Pin (prev — reduced weight) ⚠️"
+            score += 11; trigger = True
+            trigger_label = "🕯️ 1H Bear Pin (prev candle) ✅"
         elif p1.get('shooting_star', 0) == 1:
-            score += 5; trigger = True   # ← reduced from 9
-            trigger_label = "🕯️ 1H Shooting Star (prev — reduced weight) ⚠️"
+            score += 9;  trigger = True
+            trigger_label = "🕯️ 1H Shooting Star (prev candle) ✅"
 
     if trigger:
         reasons.append(trigger_label)
     else:
-        score -= 12
-        failed.append("⏳ No 1H trigger candle — wait for close")
+        score -= 12  # harder penalty now — 1H trigger is the backbone
+        failed.append("⏳ No 1H trigger candle yet — setup forming, wait for close")
 
-    # ── 9. Momentum (12 pts) ─────────────────────────────────
+    # ── 6. Momentum (12 pts) ─────────────────────────────────
     rsi1  = l1.get('rsi', 50)
     macd1 = l1.get('macd', 0);  ms1  = l1.get('macd_signal', 0)
     pm1   = p1.get('macd', 0);  pms1 = p1.get('macd_signal', 0)
@@ -639,19 +433,21 @@ def score_setup(direction, ob, ob_approach, structure, sweep, fvg_near,
         if sk1 > 0.7 and sk1 < sd1:
             score += 3; reasons.append("⚡ Stoch RSI bear cross")
 
-    # ── 10. Extras: Sweep / FVG / 15M Vol / VWAP (10 pts) ───
+    # ── 7. Extras: Sweep / FVG / 15M Vol spike (10 pts) ──────
     extras = 0
     if sweep:
         extras += 4; reasons.append(f"💧 Liq. sweep @ {sweep['level']:.5f}")
     if fvg_near:
         extras += 3; reasons.append("⚡ FVG overlaps OB")
 
+    # 15M volume — only bonus use of 15M now
     vr15 = l15.get('vol_ratio', 1.0)
     if   vr15 >= 2.5:
         extras += 3; reasons.append(f"🚀 15M vol spike {vr15:.1f}x")
     elif vr15 >= 1.5:
         extras += 1; reasons.append(f"✅ 15M elevated vol {vr15:.1f}x")
 
+    # 1H VWAP confirmation
     close1 = l1.get('close', 0); vwap1 = l1.get('vwap', 0)
     if direction == 'LONG' and close1 < vwap1:
         extras = min(extras+1, 10); reasons.append("✅ 1H below VWAP")
@@ -682,58 +478,25 @@ class SMCProScanner:
         self.signal_history = deque(maxlen=300)
         self.is_scanning    = False
         self.last_debug     = []
-        self.btc_regime     = 'UNKNOWN'  # NEW: track BTC market state
         self.stats = {
             'total': 0, 'long': 0, 'short': 0,
             'elite': 0, 'premium': 0, 'high': 0,
             'tp1': 0, 'tp2': 0, 'tp3': 0, 'sl': 0,
-            'skipped_chop': 0,   # NEW
-            'skipped_stale': 0,  # NEW
             'last_scan': None, 'pairs_scanned': 0
         }
-
-    async def get_btc_regime(self):
-        """
-        NEW v5.0: Check if BTC itself is in chop.
-        If BTC ADX < ADX_CHOP_HARD_GATE, alts will also chop — skip most alt signals.
-        Returns 'TRENDING' | 'RANGING' | 'CHOP'
-        """
-        try:
-            raw = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=60)
-            df  = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
-            df  = add_indicators(df)
-            adx = df['adx'].iloc[-1]
-            if pd.isna(adx):
-                return 'UNKNOWN'
-            if adx < ADX_CHOP_HARD_GATE:
-                return 'CHOP'
-            elif adx < ADX_RANGE_THRESHOLD:
-                return 'RANGING'
-            return 'TRENDING'
-        except Exception as e:
-            logger.error(f"BTC regime check: {e}")
-            return 'UNKNOWN'
 
     async def get_pairs(self):
         try:
             await self.exchange.load_markets()
             tickers = await self.exchange.fetch_tickers()
-            pairs = []
-            for s in self.exchange.symbols:
-                if not s.endswith('/USDT:USDT'): continue
-                if 'PERP' in s: continue
-                t = tickers.get(s, {})
-                vol = t.get('quoteVolume', 0)
-                if vol < MIN_VOLUME_24H: continue
-                # v5.0: Filter out wide-spread pairs (illiquid noise)
-                ask = t.get('ask', 0); bid = t.get('bid', 0)
-                if ask > 0 and bid > 0:
-                    spread = (ask - bid) / ask
-                    if spread > MAX_SPREAD_PCT:
-                        continue
-                pairs.append(s)
+            pairs = [
+                s for s in self.exchange.symbols
+                if s.endswith('/USDT:USDT')
+                and 'PERP' not in s
+                and tickers.get(s, {}).get('quoteVolume', 0) > MIN_VOLUME_24H
+            ]
             pairs.sort(key=lambda x: tickers.get(x, {}).get('quoteVolume', 0), reverse=True)
-            logger.info(f"✅ {len(pairs)} pairs after vol+spread filter")
+            logger.info(f"✅ {len(pairs)} pairs (vol>${MIN_VOLUME_24H/1e6:.0f}M)")
             return pairs
         except Exception as e:
             logger.error(f"Pairs: {e}"); return []
@@ -742,6 +505,8 @@ class SMCProScanner:
         try:
             result = {}
             for tf, lim in [('4h', 220), ('1h', 150), ('15m', 80)]:
+                # 1H gets more candles now (it's doing more work)
+                # 15M only needs recent candles for vol check
                 raw = await self.exchange.fetch_ohlcv(symbol, tf, limit=lim)
                 df  = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
                 df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -760,16 +525,9 @@ class SMCProScanner:
                 debug['gates'].append('❌ Not enough candle data')
                 return None, debug
 
-            price = df1['close'].iloc[-1]
+            price = df1['close'].iloc[-1]   # price from 1H now (more stable)
 
-            # Gate 1: 4H ADX Regime (HARD GATE — NEW v5.0)
-            adx_regime, adx_val, adx_msg = self.smc.check_adx_regime(df4)
-            debug['gates'].append(adx_msg)
-            if adx_regime == 'CHOP':
-                self.stats['skipped_chop'] += 1
-                return None, debug
-
-            # Gate 2: 4H Bias (EMA)
+            # Gate 1: 4H Bias
             l4 = df4.iloc[-1]
             e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0)
             if e21 > e50:       bias = 'LONG'
@@ -779,16 +537,11 @@ class SMCProScanner:
                 return None, debug
             debug['bias'] = bias
 
-            # Gate 3: DI Alignment (NEW v5.0 — soft gate, affects score)
-            di_aligned, di_msg = self.smc.check_di_alignment(df4, bias)
-            debug['gates'].append(di_msg)
-            # Not a hard gate, but penalty in scorer
-
-            # Gate 4: HH/LL bonus check
+            # HH/LL bonus check (not a gate)
             hh_ll_ok, hh_ll_msg = self.smc.check_4h_hh_ll(df4, bias, HH_LL_LOOKBACK)
             debug['gates'].append(hh_ll_msg)
 
-            # Gate 5: PD Zone
+            # Gate 2: PD Zone
             pd_label, pd_pos = self.smc.pd_zone(df4, price)
             if bias == 'LONG' and pd_label == 'PREMIUM':
                 debug['gates'].append(f'❌ PD zone: PREMIUM ({pd_pos*100:.0f}%) — no longs here')
@@ -798,7 +551,7 @@ class SMCProScanner:
                 return None, debug
             debug['gates'].append(f'✅ PD zone: {pd_label} ({pd_pos*100:.0f}%)')
 
-            # Gate 6: 1H Structure
+            # Gate 3: 1H Structure
             highs1, lows1 = self.smc.swing_highs_lows(df1, left=4, right=4)
             structure = self.smc.detect_structure_break(df1, highs1, lows1, lookback=STRUCTURE_LOOKBACK)
             if structure:
@@ -814,12 +567,12 @@ class SMCProScanner:
             else:
                 debug['gates'].append('⚠️ No recent BOS/MSS (score=0 but continuing)')
 
-            # Gate 7: 1H Order Block (HARD GATE)
+            # Gate 4: 1H Order Block (HARD GATE)
             obs = self.smc.find_order_blocks(df1, bias, lookback=60)
             if not obs:
-                debug['gates'].append(f'❌ No valid fresh {bias} OBs on 1H (all mitigated or stale)')
+                debug['gates'].append(f'❌ No valid {bias} OBs on 1H')
                 return None, debug
-            debug['gates'].append(f'✅ {len(obs)} fresh OB(s) found on 1H')
+            debug['gates'].append(f'✅ {len(obs)} OB(s) found on 1H')
 
             active_ob = None
             for ob in obs:
@@ -831,16 +584,9 @@ class SMCProScanner:
                 dist_pct  = min(abs(price - nearest['top']), abs(price - nearest['bottom'])) / price * 100
                 debug['gates'].append(f'❌ Price not at OB — nearest {dist_pct:.2f}% away [{nearest["bottom"]:.5f}–{nearest["top"]:.5f}]')
                 return None, debug
-            debug['gates'].append(f'✅ Price IN OB [{active_ob["bottom"]:.5f}–{active_ob["top"]:.5f}] (mit:{active_ob["mitigation"]*100:.0f}%, age:{active_ob["age"]}bars)')
+            debug['gates'].append(f'✅ Price IN OB [{active_ob["bottom"]:.5f}–{active_ob["top"]:.5f}]')
 
-            # Gate 8: OB Approach check (NEW v5.0 — HARD GATE for STALE)
-            ob_approach = self.smc.check_ob_approach(df1, active_ob, bias, OB_MAX_CANDLES_INSIDE)
-            debug['gates'].append(ob_approach[2])
-            if ob_approach[0] == 'STALE':
-                self.stats['skipped_stale'] += 1
-                return None, debug
-
-            # FVG (bonus)
+            # FVG on 1H (bonus)
             fvgs = self.smc.find_fvg(df1, bias, lookback=25)
             fvg_near = None
             for fvg in fvgs:
@@ -849,15 +595,15 @@ class SMCProScanner:
             if fvg_near:
                 debug['gates'].append('✅ 1H FVG overlaps OB')
 
-            # Liquidity sweep (bonus)
+            # Liquidity sweep on 1H
             sweep = self.smc.recent_liquidity_sweep(df1, bias, highs1, lows1, lookback=20)
             if sweep:
                 debug['gates'].append(f'✅ 1H liq sweep @ {sweep["level"]:.5f}')
 
             # Score
             score, reasons, failed = score_setup(
-                bias, active_ob, ob_approach, structure, sweep, fvg_near,
-                df1, df15, df4, pd_label, hh_ll_ok, adx_regime, di_aligned
+                bias, active_ob, structure, sweep, fvg_near,
+                df1, df15, df4, pd_label, hh_ll_ok
             )
             debug['score'] = score
             debug['gates'] += failed
@@ -870,10 +616,15 @@ class SMCProScanner:
             elif score >= 85: quality = 'PREMIUM 💎'
             else:             quality = 'HIGH 🔥'
 
-            # v5.0: ATR-adaptive SL (much safer than before)
             atr1  = df1['atr'].iloc[-1]
             entry = price
-            sl = self.smc.calculate_atr_sl(entry, active_ob, atr1, bias)
+
+            if bias == 'LONG':
+                sl = active_ob['bottom'] - atr1 * 0.2
+                sl = min(sl, entry - atr1 * 0.6)
+            else:
+                sl = active_ob['top'] + atr1 * 0.2
+                sl = max(sl, entry + atr1 * 0.6)
 
             risk = abs(entry - sl)
             if risk < entry * 0.001:
@@ -897,9 +648,6 @@ class SMCProScanner:
                 'quality':     quality,
                 'score':       score,
                 'hh_ll':       hh_ll_ok,
-                'adx':         adx_val,
-                'adx_regime':  adx_regime,
-                'ob_approach': ob_approach[0],
                 'entry':       entry,
                 'stop_loss':   sl,
                 'targets':     tps,
@@ -927,28 +675,38 @@ class SMCProScanner:
     def fmt(self, s):
         arrow = '🟢 LONG' if s['signal'] == 'LONG' else '🔴 SHORT'
         ob    = s['ob']
+        bar   = '█' * int(s['score'] / 10) + '░' * (10 - int(s['score'] // 10))
+        pz    = {'DISCOUNT': '🟩', 'PREMIUM': '🟥', 'NEUTRAL': '🟨'}.get(s['pd_zone'], '⬜')
 
-        tp1_pct = abs((s['targets'][0] - s['entry']) / s['entry'] * 100)
-        tp2_pct = abs((s['targets'][1] - s['entry']) / s['entry'] * 100)
-        tp3_pct = abs((s['targets'][2] - s['entry']) / s['entry'] * 100)
+        msg  = f"{'─'*36}\n"
+        msg += f"<b>{arrow}  •  {s['symbol']}USDT  •  {s['quality']}</b>\n"
+        msg += f"{'─'*36}\n\n"
 
-        msg  = f"{'─'*32}\n"
-        msg += f"{arrow}  <b>{s['symbol']}/USDT</b>  ⭐ {s['score']}/100  {s['quality']}\n"
-        msg += f"{'─'*32}\n\n"
+        msg += f"⭐ <b>{s['score']}/100</b>  <code>[{bar}]</code>\n"
+        msg += f"{pz} {s['pd_zone']}  •  {'📈 Trending' if s.get('hh_ll') else '〰️ Ranging'}\n\n"
 
         msg += f"<b>ENTRY</b>   <code>${s['entry']:.5f}</code>\n"
-        msg += f"<b>TP1</b>     <code>${s['targets'][0]:.5f}</code>  +{tp1_pct:.1f}%  — close 50%\n"
-        msg += f"<b>TP2</b>     <code>${s['targets'][1]:.5f}</code>  +{tp2_pct:.1f}%  — close 30%\n"
-        msg += f"<b>TP3</b>     <code>${s['targets'][2]:.5f}</code>  +{tp3_pct:.1f}%  — close 20%\n"
-        msg += f"<b>SL</b>      <code>${s['stop_loss']:.5f}</code>  -{s['risk_pct']:.1f}%\n\n"
+        msg += f"<b>STOP</b>    <code>${s['stop_loss']:.5f}</code>  <i>(-{s['risk_pct']:.2f}%)</i>\n\n"
 
-        msg += f"<b>OB zone</b>  <code>${ob['bottom']:.5f} – ${ob['top']:.5f}</code>\n\n"
+        for i, (tp, rr) in enumerate(zip(s['targets'], s['rr']), 1):
+            pct  = abs((tp - s['entry']) / s['entry'] * 100)
+            size = ['50%', '30%', '20%'][i - 1]
+            msg += f"<b>TP{i}</b> {size}  <code>${tp:.5f}</code>  +{pct:.2f}%  ({rr:.1f}R)\n"
 
-        # Top 3 reasons only — keep it clean
-        for r in s['reasons'][:3]:
-            msg += f"• {r}\n"
+        msg += f"\n<b>OB</b>  <code>${ob['bottom']:.5f} — ${ob['top']:.5f}</code>\n"
 
-        msg += f"\n<i>{s['timestamp'].strftime('%H:%M UTC')} — move SL to BE after TP1</i>"
+        if s['structure']:
+            sk  = s['structure']['kind']
+            lbl = 'MSS ↩️' if 'MSS' in sk else 'BOS 💥'
+            msg += f"<b>STR</b> {lbl}\n"
+
+        msg += f"\n<b>Why:</b>\n"
+        for r in s['reasons'][:6]:
+            msg += f"  {r}\n"
+
+        msg += f"\n<i>⚠️ 1-2% risk only  •  Move SL→BE after TP1</i>\n"
+        msg += f"<i>🕐 {s['timestamp'].strftime('%H:%M UTC')}  •  ID: {s['trade_id']}</i>\n"
+        msg += f"{'─'*36}"
         return msg
 
     async def send(self, text):
@@ -1016,20 +774,11 @@ class SMCProScanner:
         self.is_scanning = True
         logger.info("🔍 Scan starting...")
 
-        # v5.0: Check BTC regime before scanning alts
-        self.btc_regime = await self.get_btc_regime()
-        btc_warn = ""
-        if self.btc_regime == 'CHOP':
-            btc_warn = "\n⚠️ <b>BTC in CHOP — signal quality reduced. Fewer signals expected.</b>"
-        elif self.btc_regime == 'RANGING':
-            btc_warn = "\n⚠️ BTC ranging — only highest-confluence setups will pass."
-
         await self.send(
-            f"🔍 <b>SMC v5.0 SCAN STARTED</b>\n"
-            f"Entry: <b>1H trigger</b> | OB: fresh ≤25% mit | Trend: 4H ADX gate\n"
-            f"Min score: {MIN_SCORE} | OB tolerance: {OB_TOLERANCE_PCT*100:.1f}%\n"
-            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | Spread: <{MAX_SPREAD_PCT*100:.2f}%\n"
-            f"BTC regime: <b>{self.btc_regime}</b>{btc_warn}"
+            f"🔍 <b>SMC v4.0 SCAN STARTED</b>\n"
+            f"Entry: <b>1H trigger</b> | Structure: 1H | Trend: 4H\n"
+            f"Min score: {MIN_SCORE} | OB tol: {OB_TOLERANCE_PCT*100:.1f}%\n"
+            f"Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M | HH/LL bonus: +{HH_LL_BONUS}pts"
         )
 
         pairs       = await self.get_pairs()
@@ -1081,20 +830,16 @@ class SMCProScanner:
         lg = sum(1 for s in top if s['signal'] == 'LONG')
         tr = sum(1 for s in top if s.get('hh_ll'))
 
-        summ  = f"✅ <b>SCAN COMPLETE — v5.0</b>\n\n"
+        summ  = f"✅ <b>SCAN COMPLETE — v4.0</b>\n\n"
         summ += f"📊 Pairs scanned: {scanned}\n"
         summ += f"🔍 Candidates:    {len(candidates)}\n"
         summ += f"🎯 Signals sent:  {len(top)}\n"
-        summ += f"⛔ Skipped chop:  {self.stats['skipped_chop']}\n"
-        summ += f"⏱ Skipped stale: {self.stats['skipped_stale']}\n"
         if top:
             summ += f"  👑 Elite:    {el}\n  💎 Premium:  {pr}\n  🔥 High:     {hi}\n"
             summ += f"  🟢 Long:     {lg}\n  🔴 Short:    {len(top)-lg}\n"
             summ += f"  🏔️ Trending: {tr}\n  〰️ Ranging:  {len(top)-tr}\n"
         else:
             summ += f"\n<i>No setups met criteria this scan.</i>\n"
-            if self.btc_regime == 'CHOP':
-                summ += f"⚠️ BTC in chop — most markets ranging. Normal.\n"
             summ += f"Near misses: {len(near_misses)} — use /debug\n"
         summ += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
         await self.send(summ)
@@ -1104,19 +849,18 @@ class SMCProScanner:
         return top
 
     async def run(self, interval_min=SCAN_INTERVAL_MIN):
-        logger.info("🚀 SMC Pro v5.0 starting")
+        logger.info("🚀 SMC Pro v4.0 starting")
         await self.send(
-            "👑 <b>SMC PRO v5.0 — ORDER BLOCK SCANNER</b> 👑\n\n"
+            "👑 <b>SMC PRO v4.0 — ORDER BLOCK SCANNER</b> 👑\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>4H ADX Gate → 4H Trend → 1H Fresh OB + Trigger → 15M Vol</b>\n\n"
-            f"✅ Hard gate: ADX ≥ {ADX_CHOP_HARD_GATE} (no chop trades)\n"
-            f"✅ OB freshness: ≤{OB_MAX_CANDLES_INSIDE} candles inside, ≤{OB_MAX_MITIGATION_PCT*100:.0f}% mitigated\n"
-            f"✅ SL: ATR-adaptive min {ATR_SL_MINIMUM_MULT}x ATR\n"
-            f"✅ Entry trigger: 1H candles\n"
+            "<b>4H Trend  →  1H Structure + OB + Entry  →  15M Vol</b>\n\n"
+            f"✅ Entry trigger: <b>1H candles</b> (upgraded from 15M)\n"
             f"✅ Min score: {MIN_SCORE}/100\n"
-            f"✅ Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M/day | Spread: <{MAX_SPREAD_PCT*100:.2f}%\n"
+            f"✅ OB tolerance: {OB_TOLERANCE_PCT*100:.1f}%\n"
+            f"✅ Vol filter: ${MIN_VOLUME_24H/1e6:.0f}M/day\n"
             f"✅ 4H HH/LL bonus: +{HH_LL_BONUS}pts\n"
-            f"✅ Trade timeout: 48H | Scan every: {SCAN_INTERVAL_MIN}min\n\n"
+            f"✅ Trade timeout: 48H\n"
+            f"✅ Scan every: {SCAN_INTERVAL_MIN} min\n\n"
             "Commands: /scan /stats /trades /debug /help\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -1143,13 +887,9 @@ class Commands:
 
     async def start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "👑 <b>SMC Pro v5.0</b>\n\n"
-            "Key upgrades:\n"
-            "• ADX chop gate — no signals in ranging markets\n"
-            "• Fresh OB only — ≤25% mitigated, ≤3 candles inside\n"
-            "• ATR-adaptive SL — no more wicked-out stops\n"
-            "• DI alignment check — confirms true trend direction\n"
-            "• BTC regime check — warns when alts will chop\n\n"
+            "👑 <b>SMC Pro v4.0</b>\n\n"
+            "1H entry trigger — cleaner, stronger signals.\n\n"
+            "Stack: 4H trend → 1H structure + OB + trigger → 15M vol\n\n"
             "/scan /stats /trades /debug /help",
             parse_mode=ParseMode.HTML
         )
@@ -1162,18 +902,15 @@ class Commands:
 
     async def stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         s = self.s.stats
-        msg  = "📊 <b>SMC PRO v5.0 STATS</b>\n\n"
+        msg  = "📊 <b>SMC PRO v4.0 STATS</b>\n\n"
         msg += f"Total signals: {s['total']}\n"
         msg += f"  👑 Elite: {s['elite']}  💎 Premium: {s['premium']}  🔥 High: {s['high']}\n"
         msg += f"  🟢 Long: {s['long']}  🔴 Short: {s['short']}\n\n"
         msg += f"TP1: {s['tp1']} | TP2: {s['tp2']} | TP3: {s['tp3']} | SL: {s['sl']}\n\n"
-        msg += f"Skipped (chop): {s['skipped_chop']}\n"
-        msg += f"Skipped (stale OB): {s['skipped_stale']}\n\n"
         if s['last_scan']:
             msg += f"Last scan: {s['last_scan'].strftime('%H:%M UTC')}\n"
             msg += f"Pairs: {s['pairs_scanned']}\n"
-        msg += f"Active trades: {len(self.s.active_trades)}\n"
-        msg += f"BTC regime: {self.s.btc_regime}"
+        msg += f"Active: {len(self.s.active_trades)}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def trades(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1184,8 +921,7 @@ class Commands:
             age      = int((datetime.now() - t['timestamp']).total_seconds()/3600)
             tps      = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
             trend_tag = '🏔️' if t.get('hh_ll') else '〰️'
-            fresh_tag = {'FRESH':'🆕','RECENT':'⏱','STALE':'⚠️'}.get(t.get('ob_approach',''),'')
-            msg += (f"<b>{t['symbol']}</b> {t['signal']} {trend_tag}{fresh_tag} — {t['quality']}\n"
+            msg += (f"<b>{t['symbol']}</b> {t['signal']} {trend_tag} — {t['quality']}\n"
                     f"  Entry: <code>${t['entry']:.5f}</code> | Score: {t['score']}\n"
                     f"  TPs: {tps} | {age}h old\n\n")
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -1198,47 +934,39 @@ class Commands:
         msg += "<i>(At OB but below score threshold)</i>\n\n"
         for d in self.s.last_debug[:8]:
             msg += f"<b>{d['symbol']}</b> {d['bias']} — Score: {d['score']}/100\n"
-            # v5.0: Show exactly what caused it to fail
-            fail_reasons = [g for g in d['gates'] if g.startswith('❌') or g.startswith('⚠️')]
-            for g in fail_reasons[-3:]:
+            for g in d['gates'][-4:]:
                 msg += f"  {g}\n"
             msg += "\n"
-        msg += f"<i>Min score: {MIN_SCORE}. Raise/lower in TUNABLE SETTINGS.</i>"
+        msg += f"<i>Min score: {MIN_SCORE}. 1H trigger = up to +25pts.</i>"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>SMC PRO v5.0 — STRATEGY</b>\n\n"
+        msg  = "📚 <b>SMC PRO v4.0 — STRATEGY</b>\n\n"
         msg += "<b>Timeframe Stack:</b>\n"
-        msg += "  4H  → ADX gate + EMA bias + DI check + HH/LL\n"
-        msg += "  1H  → BOS/MSS + Fresh OB (≤25% mit) + Trigger  ← core\n"
+        msg += "  4H  → EMA bias + HH/LL depth\n"
+        msg += "  1H  → BOS/MSS + OB zone + Entry trigger  ← core\n"
         msg += "  15M → Volume spike bonus only\n\n"
         msg += "<b>Hard Gates (ALL must pass):</b>\n"
-        msg += f"  1️⃣ 4H ADX ≥ {ADX_CHOP_HARD_GATE} (no chop)\n"
-        msg += "  2️⃣ 4H EMA 21/50 bias\n"
-        msg += "  3️⃣ PD zone filter\n"
-        msg += "  4️⃣ 1H BOS/MSS within 20 candles\n"
-        msg += f"  5️⃣ Price at fresh 1H OB (≤{OB_MAX_MITIGATION_PCT*100:.0f}% mit, ≤{OB_MAX_AGE_BARS}bars old)\n"
-        msg += f"  6️⃣ OB not stale (price inside ≤{OB_MAX_CANDLES_INSIDE} candles)\n"
-        msg += f"  7️⃣ Score ≥ {MIN_SCORE}/100\n\n"
+        msg += "  1️⃣ 4H EMA 21/50 bias\n"
+        msg += "  2️⃣ PD zone (no longs premium / no shorts discount)\n"
+        msg += "  3️⃣ 1H BOS/MSS within 20 candles\n"
+        msg += "  4️⃣ Price at valid 1H Order Block\n"
+        msg += f"  5️⃣ Score ≥ {MIN_SCORE}/100\n\n"
         msg += "<b>Score System (max 100):</b>\n"
-        msg += "  +25 — 1H entry trigger (current candle only for max pts)\n"
+        msg += "  +25 — 1H entry trigger (engulf/pin/hammer) ⭐ main\n"
         msg += "  +20 — MSS structure\n"
         msg += "  +20 — Tight OB quality\n"
         msg += "  +15 — 4H triple EMA\n"
-        msg += "  +8  — Fresh OB entry (NEW)\n"
         msg += f"  +{HH_LL_BONUS}  — 4H HH/LL confirmed\n"
-        msg += "  +5  — DI aligned (NEW)\n"
-        msg += "  +5  — ADX trending (NEW)\n"
         msg += "  +12 — Momentum (RSI/MACD/Stoch)\n"
-        msg += "  +10 — Extras (sweep/FVG/vol)\n"
-        msg += f"  -{ADX_RANGE_PENALTY} — ADX ranging penalty (NEW)\n"
-        msg += "  -10 — Stale OB penalty (NEW)\n\n"
-        msg += "<b>SL v5.0:</b>\n"
-        msg += f"  ATR-adaptive: min {ATR_SL_MINIMUM_MULT}x ATR buffer\n"
-        msg += "  Much wider than v4 — fewer wicked stops\n\n"
+        msg += "  +10 — Extras (sweep/FVG/vol)\n\n"
+        msg += "<b>TP timing adjusted for 1H entries:</b>\n"
+        msg += "  TP1 = 1:1.5 RR  [6-12h]\n"
+        msg += "  TP2 = 1:2.5 RR  [12-24h]\n"
+        msg += "  TP3 = 1:4.0 RR  [24-48h]\n\n"
         msg += "<b>Config:</b>\n"
-        msg += f"  MIN_SCORE={MIN_SCORE} | OB_MIT_CAP={OB_MAX_MITIGATION_PCT*100:.0f}%\n"
-        msg += f"  OB_MAX_AGE={OB_MAX_AGE_BARS}bars | ADX_GATE={ADX_CHOP_HARD_GATE}"
+        msg += f"  MIN_SCORE={MIN_SCORE} | HH_LL_BONUS={HH_LL_BONUS}\n"
+        msg += f"  OB_TOLERANCE={OB_TOLERANCE_PCT} | LOOKBACK={HH_LL_LOOKBACK}"
         await u.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -1273,7 +1001,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SMC Pro v5.0 ready!")
+    logger.info("🤖 SMC Pro v4.0 ready!")
 
     try:
         await scanner.run(interval_min=SCAN_INTERVAL_MIN)
