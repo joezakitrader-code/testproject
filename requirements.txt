@@ -1,4 +1,4 @@
-ccxt
+ccxt==4.3.98
 python-telegram-bot
 pandas
 numpy
