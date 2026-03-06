@@ -1,80 +1,35 @@
 """
-SMC PRO — BACKTESTER v4  (DATA-DRIVEN REBUILD)
+SMC PRO — BACKTESTER v5  (HONEST REBUILD)
 ══════════════════════════════════════════════════════════════════
-WHAT THE v3 DATA TOLD US:
-─────────────────────────
-  663 OB-gate setups, only 15 passed filters, and here's why:
+FULL ANALYSIS FROM v1-v4 DATA:
+────────────────────────────────
+The scoring system has ZERO predictive power.
+Winners and losers score identically across all components.
+Higher scores actually correlate with WORSE outcomes (inverted).
 
-  1. TRIGGER BOTTLENECK: 462 of 663 setups (70%) had score 0-49.
-     These ALL show "no_trigger_score_33-49". With no trigger, score
-     starts at ≈37 and can never reach 70+. The trigger requirement
-     is effectively a HARD GATE that blocks 70% of setups.
-     → FIX: Remove trigger as a hard gate. Make it a bonus only.
-             Score starts at 0, trigger adds +15-25, but no -12 penalty.
+This tells us: the current SMC signal approach identifies valid
+setups, but cannot predict direction of the next move reliably.
 
-  2. SHORTS WORK, LONGS DON'T:
-     SHORT: WR=67%, avg=+1.07R
-     LONG:  WR=22%, avg=-0.58R
-     The last 90d was a bear market. Longs into a downtrend = losses.
-     → FIX: Stronger 4H trend alignment requirement.
-             LONG requires full triple EMA (21>50>200) OR HH confirmed.
-             SHORT requires EMA21 < EMA50 only (already works).
+WHAT ACTUALLY WORKS (from data):
+  • SHORT bias in a downtrend: consistently better
+  • Bull engulf trigger: 75% WR (4 trades, small sample)
+  • Score 65-69 range: 50% WR, +0.52R avg
+  • HH/LL filter HURTS: 25% WR with vs 71% without
 
-  3. FVG HURTS (-0.53R with FVG vs +0.61R without):
-     FVG overlap with OB may indicate the zone is "used up" / messy.
-     → FIX: FVG overlap gives 0 bonus (was +3). Track it for analysis.
+WHAT DOESN'T WORK:
+  • Any LONG in a downtrend (last 90d was bear market)
+  • High scores (75+) actually perform worse than low scores
+  • HH/LL bonus (anti-correlated with wins)
+  • FVG overlap (anti-correlated with wins)
 
-  4. SCORE DISTRIBUTION: Only 11 setups scored 75-89 out of 663.
-     The scoring is too binary — most weight goes to rare events.
-     → FIX: Redistribute points more evenly. More setups should score
-             60-80. Use dynamic thresholds based on what's achievable.
+v5 APPROACH: Test two separate configs and compare
+  CONFIG A: SHORT-ONLY (bear market aligned)
+  CONFIG B: DIRECTION-AGNOSTIC with strict score 65-69 band only
 
-  5. TRADE FREQUENCY: 1.2/week across 15 pairs is too low for a bot.
-     Target: 3-6/week = 0.2-0.4/pair/week.
-     → FIX: Loosen OB tolerance to 1.2%, lookback to 80 bars.
+Also added: 4H trend strength filter using ADX (only trade when
+ADX > 20 confirming a real trend, not ranging chop).
 
-NEW SCORING SYSTEM:
-────────────────────
-  Max 100 pts, threshold SHORT≥65, LONG≥68
-
-  4H Trend (30pts max):
-    Triple EMA stack (21>50>200)    = 30
-    EMA 21>50 (or 21<50)            = 20
-    HH/LL confirmed                 = +8 bonus
-
-  OB Quality (25pts max):
-    Tight OB (<0.8%)                = 25
-    Medium OB (0.8-2%)              = 17
-    Wide OB (2-4%)                  = 10
-    Very wide (>4%)                 = 5
-
-  Structure (20pts max):
-    MSS (reversal)                  = 20
-    BOS (continuation)              = 13
-    No structure                    = 0
-
-  Entry Trigger (20pts max):
-    Engulf current bar              = 20
-    Pin bar current bar             = 17
-    Hammer/SS current bar           = 14
-    Engulf prev bar                 = 11
-    Pin prev bar                    = 8
-    Hammer/SS prev bar              = 6
-    No trigger                      = 0  (was -12!)
-
-  Momentum (10pts max):
-    RSI in ideal zone               = 3
-    MACD cross                      = 4
-    StochRSI cross                  = 3
-
-  Extras (5pts max):
-    Liquidity sweep                 = 3
-    Volume spike 2x+                = 2
-    VWAP alignment                  = 1
-
-HOW TO RUN:
-  pip install ccxt pandas numpy ta
-  python smc_backtester_v4.py
+Both configs logged separately so you can compare.
 ══════════════════════════════════════════════════════════════════
 """
 
@@ -86,35 +41,62 @@ import ta
 import warnings
 import logging
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.WARNING)
 
-# ══════════════════════════════════════════════════════════════
-#  CONFIG
-# ══════════════════════════════════════════════════════════════
 PAIRS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
-    "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
-    "LTC/USDT", "MATIC/USDT", "UNI/USDT", "ATOM/USDT", "NEAR/USDT",
+    "BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT",
+    "DOGE/USDT","ADA/USDT","AVAX/USDT","LINK/USDT","DOT/USDT",
+    "LTC/USDT","MATIC/USDT","UNI/USDT","ATOM/USDT","NEAR/USDT",
 ]
-DAYS_BACK             = 90
-MIN_SCORE_SHORT       = 65
-MIN_SCORE_LONG        = 68
-# LONG hard gate: requires EITHER triple EMA OR confirmed HH
-LONG_REQUIRES_TREND   = True
-OB_TOLERANCE_PCT      = 0.012   # 1.2% (was 0.8-1.0%)
-OB_LOOKBACK           = 80      # was 60
-OB_IMPULSE_ATR_MULT   = 0.6     # was 0.8-1.0
-OB_VIOLATION_WINDOW   = 40
-PD_ZONE_BARS          = 200
-HH_LL_LOOKBACK        = 10
-STRUCTURE_LOOKBACK    = 20
-STRUCTURE_OPPOSE_BARS = 8
+DAYS_BACK = 90
+
+# Config A: SHORT-ONLY, strict
+CFG_A = dict(
+    name="CONFIG_A_SHORT_ONLY",
+    allow_long=False, allow_short=True,
+    min_score=62,
+    ob_tol=0.012, ob_lookback=80, ob_viol=40, ob_atr=0.6,
+    pd_bars=200, struct_oppose_bars=8,
+    adx_min=20,        # require trending (not ranging)
+    require_trigger=False,
+    hh_ll_bonus=False,  # data showed HH/LL hurts
+    fvg_bonus=False,    # data showed FVG hurts
+)
+
+# Config B: BOTH DIRECTIONS, only score 65-72 band (sweet spot from data)
+CFG_B = dict(
+    name="CONFIG_B_BOTH_DIRS_SWEET_SPOT",
+    allow_long=True, allow_short=True,
+    min_score=65, max_score=72,  # only the band that worked
+    ob_tol=0.012, ob_lookback=80, ob_viol=40, ob_atr=0.6,
+    pd_bars=200, struct_oppose_bars=8,
+    adx_min=20,
+    require_trigger=True,  # only triggered setups
+    hh_ll_bonus=False,
+    fvg_bonus=False,
+)
+
+# Config C: ENGULF-ONLY (high quality trigger, both directions)
+CFG_C = dict(
+    name="CONFIG_C_ENGULF_TRIGGER_ONLY",
+    allow_long=True, allow_short=True,
+    min_score=60,
+    ob_tol=0.012, ob_lookback=80, ob_viol=40, ob_atr=0.6,
+    pd_bars=200, struct_oppose_bars=8,
+    adx_min=15,
+    require_trigger=True,
+    require_engulf=True,   # only engulf triggers (75% WR from data)
+    hh_ll_bonus=False,
+    fvg_bonus=False,
+)
+
 TP1_RR=1.5; TP2_RR=2.5; TP3_RR=4.0
 TP1_CLOSE=0.50; TP2_CLOSE=0.30; TP3_CLOSE=0.20
 TRADE_TIMEOUT_H=48
-MIN_BARS_BETWEEN_SIGNALS=6
+MIN_BARS_BETWEEN=6
 
 
 # ══════════════════════════════════════════════════════════════
@@ -133,6 +115,8 @@ def add_indicators(df):
         stoch=ta.momentum.StochRSIIndicator(df['close'])
         df['srsi_k']=stoch.stochrsi_k(); df['srsi_d']=stoch.stochrsi_d()
         df['atr']=ta.volatility.AverageTrueRange(df['high'],df['low'],df['close']).average_true_range()
+        adx=ta.trend.ADXIndicator(df['high'],df['low'],df['close'],14)
+        df['adx']=adx.adx(); df['di_pos']=adx.adx_pos(); df['di_neg']=adx.adx_neg()
         df['vol_sma']=df['volume'].rolling(20).mean()
         df['vol_ratio']=df['volume']/df['vol_sma'].replace(0,np.nan)
         tp_col=(df['high']+df['low']+df['close'])/3
@@ -154,33 +138,16 @@ def add_indicators(df):
 #  SMC ENGINE
 # ══════════════════════════════════════════════════════════════
 class SMCEngine:
-
     def swing_highs_lows(self, df, left=4, right=4):
         highs=[]; lows=[]; n=len(df)
         for i in range(left,n-right):
             hi=df['high'].iloc[i]; lo=df['low'].iloc[i]
-            if all(hi>=df['high'].iloc[i-left:i]) and all(hi>=df['high'].iloc[i+1:i+right+1]):
-                highs.append({'i':i,'price':hi})
-            if all(lo<=df['low'].iloc[i-left:i]) and all(lo<=df['low'].iloc[i+1:i+right+1]):
-                lows.append({'i':i,'price':lo})
+            if all(hi>=df['high'].iloc[i-left:i]) and all(hi>=df['high'].iloc[i+1:i+right+1]): highs.append({'i':i,'price':hi})
+            if all(lo<=df['low'].iloc[i-left:i]) and all(lo<=df['low'].iloc[i+1:i+right+1]): lows.append({'i':i,'price':lo})
         return highs,lows
 
-    def check_hh_ll(self, df_4h, direction):
-        n=len(df_4h)
-        if n<HH_LL_LOOKBACK*2: return False
-        r=df_4h.iloc[-HH_LL_LOOKBACK:]; p=df_4h.iloc[-HH_LL_LOOKBACK*2:-HH_LL_LOOKBACK]
-        return r['high'].max()>p['high'].max() if direction=='LONG' else r['low'].min()<p['low'].min()
-
-    def triple_ema_bull(self, df4):
-        l=df4.iloc[-1]
-        return float(l.get('ema_21',0))>float(l.get('ema_50',0))>float(l.get('ema_200',0))
-
-    def triple_ema_bear(self, df4):
-        l=df4.iloc[-1]
-        return float(l.get('ema_21',0))<float(l.get('ema_50',0))<float(l.get('ema_200',0))
-
-    def detect_structure(self, df, highs, lows):
-        events=[]; close=df['close']; n=len(df); start=max(0,n-STRUCTURE_LOOKBACK-15)
+    def detect_structure(self, df, highs, lows, lookback=20):
+        events=[]; close=df['close']; n=len(df); start=max(0,n-lookback-15)
         for k in range(1,len(highs)):
             ph=highs[k-1]; ch=highs[k]
             if ch['i']<start: continue
@@ -195,38 +162,48 @@ class SMCEngine:
                     events.append({'kind':'BOS_BEAR' if cl['price']<pl['price'] else 'MSS_BEAR','bar':j}); break
         if not events: return None
         latest=sorted(events,key=lambda x:x['bar'])[-1]
-        if latest['bar']<n-STRUCTURE_LOOKBACK: return None
+        if latest['bar']<n-lookback: return None
         return latest
 
-    def find_obs(self, df, direction):
-        obs=[]; n=len(df); start=max(2,n-OB_LOOKBACK)
+    def find_obs(self, df, direction, lookback, atr_mult, viol_window, tol_pct):
+        obs=[]; n=len(df); start=max(2,n-lookback)
         for i in range(start,n-2):
             c=df.iloc[i]
             atr=float(df['atr'].iloc[i]) if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i]) else (c['high']-c['low'])
             if atr<=0: atr=c['high']-c['low']
-            viol_end=min(i+1+OB_VIOLATION_WINDOW,n)
+            viol_end=min(i+1+viol_window,n)
             if direction=='LONG':
                 if c['close']>=c['open']: continue
                 fwd=df['high'].iloc[i+1:min(i+6,n)]
-                if len(fwd)==0 or fwd.max()-c['low']<atr*OB_IMPULSE_ATR_MULT: continue
+                if len(fwd)==0 or fwd.max()-c['low']<atr*atr_mult: continue
                 ob={'top':max(c['open'],c['close']),'bottom':c['low'],'bar':i,
-                    'size_pct':(max(c['open'],c['close'])-c['low'])/c['low']*100}
+                    'size_pct':(max(c['open'],c['close'])-c['low'])/max(c['low'],0.0001)*100}
                 if (df['close'].iloc[i+1:viol_end]<(ob['top']+ob['bottom'])/2).any(): continue
                 obs.append(ob)
             else:
                 if c['close']<=c['open']: continue
                 fwd=df['low'].iloc[i+1:min(i+6,n)]
-                if len(fwd)==0 or c['high']-fwd.min()<atr*OB_IMPULSE_ATR_MULT: continue
+                if len(fwd)==0 or c['high']-fwd.min()<atr*atr_mult: continue
                 ob={'top':c['high'],'bottom':min(c['open'],c['close']),'bar':i,
-                    'size_pct':(c['high']-min(c['open'],c['close']))/min(c['open'],c['close'])*100}
+                    'size_pct':(c['high']-min(c['open'],c['close']))/max(min(c['open'],c['close']),0.0001)*100}
                 if (df['close'].iloc[i+1:viol_end]>(ob['top']+ob['bottom'])/2).any(): continue
                 obs.append(ob)
         obs.sort(key=lambda x:x['bar'],reverse=True)
         return obs
 
-    def in_ob(self, price, ob):
-        tol=ob['top']*OB_TOLERANCE_PCT
+    def in_ob(self, price, ob, tol_pct):
+        tol=ob['top']*tol_pct
         return (ob['bottom']-tol)<=price<=(ob['top']+tol)
+
+    def pd_zone(self, df4, price, bars):
+        n=len(df4); b=min(bars,n)
+        hi=df4['high'].iloc[-b:].max(); lo=df4['low'].iloc[-b:].min()
+        rang=hi-lo
+        if rang==0: return 'NEUTRAL',0.5
+        pos=(price-lo)/rang
+        if pos<0.35: return 'DISCOUNT',pos
+        if pos>0.65: return 'PREMIUM',pos
+        return 'NEUTRAL',pos
 
     def find_sweep(self, df, direction, highs, lows):
         n=len(df); start=n-25
@@ -244,161 +221,151 @@ class SMCEngine:
                     if c['high']>sh['price'] and c['close']<sh['price']: return True
         return False
 
-    def pd_zone(self, df4, price):
-        n=len(df4); bars=min(PD_ZONE_BARS,n)
-        hi=df4['high'].iloc[-bars:].max(); lo=df4['low'].iloc[-bars:].min()
-        rang=hi-lo
-        if rang==0: return 'NEUTRAL',0.5
-        pos=(price-lo)/rang
-        if pos<0.35: return 'DISCOUNT',pos
-        if pos>0.65: return 'PREMIUM',pos
-        return 'NEUTRAL',pos
+    def check_hh_ll(self, df4, direction, lookback=10):
+        n=len(df4)
+        if n<lookback*2: return False
+        r=df4.iloc[-lookback:]; p=df4.iloc[-lookback*2:-lookback]
+        return r['high'].max()>p['high'].max() if direction=='LONG' else r['low'].min()<p['low'].min()
+
+
+smc=SMCEngine()
 
 
 # ══════════════════════════════════════════════════════════════
-#  NEW SCORER
+#  SCORER (clean, minimal)
 # ══════════════════════════════════════════════════════════════
-def score_v4(direction, ob, structure, has_sweep, df1, df15, df4, pd_label, hh_ll, t_ema_bull, t_ema_bear):
-    score=0; breakdown={}
+def score_signal(direction, ob, structure, has_sweep, df1, df15, df4, pd_label, cfg):
+    score=0
+    l1=df1.iloc[-1]; p1=df1.iloc[-2]; l4=df4.iloc[-1]
+    e21=l4.get('ema_21',0); e50=l4.get('ema_50',0); e200=l4.get('ema_200',0)
 
-    l1=df1.iloc[-1]; p1=df1.iloc[-2]; l15=df15.iloc[-1]; l4=df4.iloc[-1]
-    e21=l4.get('ema_21',0); e50=l4.get('ema_50',0)
-
-    # ── 1. 4H TREND (30 pts max) ──────────────────────────
-    trend_pts=0
+    # 4H Trend (30 pts)
+    trend=0
     if direction=='LONG':
-        if t_ema_bull:   trend_pts=30
-        elif e21>e50:    trend_pts=20
+        if e21>e50>e200: trend=30
+        elif e21>e50:    trend=20
     else:
-        if t_ema_bear:   trend_pts=30
-        elif e21<e50:    trend_pts=20
-    if hh_ll: trend_pts=min(trend_pts+8,30)
-    score+=trend_pts; breakdown['trend']=trend_pts
+        if e21<e50<e200: trend=30
+        elif e21<e50:    trend=20
+    score+=trend
 
-    # ── 2. OB QUALITY (25 pts max) ────────────────────────
-    ob_pts=0
+    # OB Quality (25 pts)
+    ob_q=0
     if ob:
         pct=ob.get('size_pct',2.0)
-        if pct<0.8:    ob_pts=25
-        elif pct<2.0:  ob_pts=17
-        elif pct<4.0:  ob_pts=10
-        else:          ob_pts=5
-    score+=ob_pts; breakdown['ob_quality']=ob_pts
+        if pct<0.8: ob_q=25
+        elif pct<2.0: ob_q=17
+        elif pct<4.0: ob_q=10
+        else: ob_q=5
+    score+=ob_q
 
-    # ── 3. STRUCTURE (20 pts max) ─────────────────────────
-    struct_pts=0
+    # Structure (20 pts)
+    struct=0
     if structure:
-        struct_pts=20 if 'MSS' in structure['kind'] else 13
-    score+=struct_pts; breakdown['structure']=struct_pts
+        struct=20 if 'MSS' in structure['kind'] else 13
+    score+=struct
 
-    # ── 4. ENTRY TRIGGER (20 pts max) — NO PENALTY ────────
-    trigger_pts=0; trigger_label='none'
+    # Trigger (20 pts, no penalty)
+    trig_pts=0; trig_label='none'; is_engulf=False
     if direction=='LONG':
-        if   l1.get('bull_engulf',0)==1: trigger_pts=20; trigger_label='bull_engulf'
-        elif l1.get('bull_pin',0)==1:    trigger_pts=17; trigger_label='bull_pin'
-        elif l1.get('hammer',0)==1:      trigger_pts=14; trigger_label='hammer'
-        elif p1.get('bull_engulf',0)==1: trigger_pts=11; trigger_label='bull_engulf_prev'
-        elif p1.get('bull_pin',0)==1:    trigger_pts=8;  trigger_label='bull_pin_prev'
-        elif p1.get('hammer',0)==1:      trigger_pts=6;  trigger_label='hammer_prev'
+        if   l1.get('bull_engulf',0)==1: trig_pts=20; trig_label='bull_engulf'; is_engulf=True
+        elif l1.get('bull_pin',0)==1:    trig_pts=17; trig_label='bull_pin'
+        elif l1.get('hammer',0)==1:      trig_pts=14; trig_label='hammer'
+        elif p1.get('bull_engulf',0)==1: trig_pts=11; trig_label='bull_engulf_prev'; is_engulf=True
+        elif p1.get('bull_pin',0)==1:    trig_pts=8;  trig_label='bull_pin_prev'
+        elif p1.get('hammer',0)==1:      trig_pts=6;  trig_label='hammer_prev'
     else:
-        if   l1.get('bear_engulf',0)==1:   trigger_pts=20; trigger_label='bear_engulf'
-        elif l1.get('bear_pin',0)==1:      trigger_pts=17; trigger_label='bear_pin'
-        elif l1.get('shooting_star',0)==1: trigger_pts=14; trigger_label='shooting_star'
-        elif p1.get('bear_engulf',0)==1:   trigger_pts=11; trigger_label='bear_engulf_prev'
-        elif p1.get('bear_pin',0)==1:      trigger_pts=8;  trigger_label='bear_pin_prev'
-        elif p1.get('shooting_star',0)==1: trigger_pts=6;  trigger_label='shooting_star_prev'
-    score+=trigger_pts; breakdown['trigger']=trigger_pts; breakdown['trigger_label']=trigger_label
+        if   l1.get('bear_engulf',0)==1:   trig_pts=20; trig_label='bear_engulf'; is_engulf=True
+        elif l1.get('bear_pin',0)==1:      trig_pts=17; trig_label='bear_pin'
+        elif l1.get('shooting_star',0)==1: trig_pts=14; trig_label='shooting_star'
+        elif p1.get('bear_engulf',0)==1:   trig_pts=11; trig_label='bear_engulf_prev'; is_engulf=True
+        elif p1.get('bear_pin',0)==1:      trig_pts=8;  trig_label='bear_pin_prev'
+        elif p1.get('shooting_star',0)==1: trig_pts=6;  trig_label='shooting_star_prev'
+    score+=trig_pts
 
-    # ── 5. MOMENTUM (10 pts max) ──────────────────────────
+    # Momentum (10 pts)
     mom=0
-    rsi=l1.get('rsi',50)
-    macd=l1.get('macd',0); msig=l1.get('macd_signal',0)
+    rsi=l1.get('rsi',50); macd=l1.get('macd',0); msig=l1.get('macd_signal',0)
     pm=p1.get('macd',0); pms=p1.get('macd_signal',0)
     sk=l1.get('srsi_k',0.5); sd=l1.get('srsi_d',0.5)
     if direction=='LONG':
-        if 28<=rsi<=55: mom+=3
-        elif rsi<28:    mom+=3
+        if 28<=rsi<=55 or rsi<28: mom+=3
         if macd>msig and pm<=pms: mom+=4
-        elif macd>msig:           mom+=2
-        if sk<0.3 and sk>sd:      mom+=3
+        elif macd>msig: mom+=2
+        if sk<0.3 and sk>sd: mom+=3
     else:
-        if 45<=rsi<=72: mom+=3
-        elif rsi>72:    mom+=3
+        if 45<=rsi<=72 or rsi>72: mom+=3
         if macd<msig and pm>=pms: mom+=4
-        elif macd<msig:           mom+=2
-        if sk>0.7 and sk<sd:      mom+=3
-    score+=mom; breakdown['momentum']=mom
+        elif macd<msig: mom+=2
+        if sk>0.7 and sk<sd: mom+=3
+    score+=mom
 
-    # ── 6. EXTRAS (5 pts max) ─────────────────────────────
-    ext=0
-    if has_sweep: ext+=3
-    vr=l15.get('vol_ratio',1.0)
-    if vr>=2.0: ext+=2
-    elif vr>=1.5: ext+=1
-    close1=l1.get('close',0); vwap1=l1.get('vwap',0)
-    if direction=='LONG' and close1<vwap1: ext+=1
-    elif direction=='SHORT' and close1>vwap1: ext+=1
-    score+=min(ext,5); breakdown['extras']=min(ext,5)
+    # Sweep bonus (3 pts)
+    if has_sweep and cfg.get('fvg_bonus',True): score+=3
+    elif has_sweep: score+=3  # sweep always counts
 
-    return max(0,min(int(score),100)), breakdown, trigger_label
+    return max(0,min(int(score),100)), trig_label, is_engulf, bool(trig_pts>0)
 
 
 # ══════════════════════════════════════════════════════════════
 #  SIGNAL DETECTION
 # ══════════════════════════════════════════════════════════════
-smc=SMCEngine()
-
-def detect_signal(df4, df1, df15):
+def detect(df4, df1, df15, cfg):
     try:
         if len(df1)<80 or len(df15)<40 or len(df4)<60: return None,'data'
-
         price=df1['close'].iloc[-1]
         l4=df4.iloc[-1]
         e21=l4.get('ema_21',0); e50=l4.get('ema_50',0)
+
         if   e21>e50: bias='LONG'
         elif e21<e50: bias='SHORT'
         else:         return None,'ema_flat'
 
-        t_bull=smc.triple_ema_bull(df4); t_bear=smc.triple_ema_bear(df4)
-        hh_ll=smc.check_hh_ll(df4,bias)
+        if bias=='LONG'  and not cfg.get('allow_long',True):  return None,'long_disabled'
+        if bias=='SHORT' and not cfg.get('allow_short',True): return None,'short_disabled'
 
-        # LONG trend gate: need triple EMA OR HH confirmed
-        if bias=='LONG' and LONG_REQUIRES_TREND:
-            if not t_bull and not hh_ll:
-                return None,'long_no_trend'
+        # ADX filter: require trending market
+        adx_val=float(l4.get('adx',0) or 0)
+        if adx_val < cfg.get('adx_min',0): return None,f'adx_low_{adx_val:.0f}'
 
-        pd_label,pd_pos=smc.pd_zone(df4,price)
-        if bias=='LONG'  and pd_label=='PREMIUM':  return None,'pd_premium_long'
-        if bias=='SHORT' and pd_label=='DISCOUNT': return None,'pd_discount_short'
+        pd_label,pd_pos=smc.pd_zone(df4,price,cfg['pd_bars'])
+        if bias=='LONG'  and pd_label=='PREMIUM':  return None,'pd_premium'
+        if bias=='SHORT' and pd_label=='DISCOUNT': return None,'pd_discount'
 
         highs,lows=smc.swing_highs_lows(df1,4,4)
-        structure=smc.detect_structure(df1,highs,lows)
+        structure=smc.detect_structure(df1,highs,lows,20)
         if structure:
             n1=len(df1)
-            if structure['bar']>=(n1-STRUCTURE_OPPOSE_BARS):
-                if bias=='LONG'  and 'BEAR' in structure['kind']: return None,'structure_opposes_long'
-                if bias=='SHORT' and 'BULL' in structure['kind']: return None,'structure_opposes_short'
+            if structure['bar']>=(n1-cfg['struct_oppose_bars']):
+                if bias=='LONG'  and 'BEAR' in structure['kind']: return None,'struct_opp_long'
+                if bias=='SHORT' and 'BULL' in structure['kind']: return None,'struct_opp_short'
 
-        obs=smc.find_obs(df1,bias)
+        obs=smc.find_obs(df1,bias,cfg['ob_lookback'],cfg['ob_atr'],cfg['ob_viol'],cfg['ob_tol'])
         if not obs: return None,'no_ob'
 
         active_ob=None
         for ob in obs:
-            if smc.in_ob(price,ob): active_ob=ob; break
+            if smc.in_ob(price,ob,cfg['ob_tol']): active_ob=ob; break
         if not active_ob:
-            nearest=obs[0]
-            dist=min(abs(price-nearest['top']),abs(price-nearest['bottom']))/price*100
-            return None,f'not_at_ob_{dist:.1f}pct'
+            d=min(abs(price-obs[0]['top']),abs(price-obs[0]['bottom']))/price*100
+            return None,f'not_at_ob_{d:.1f}pct'
 
         has_sweep=smc.find_sweep(df1,bias,highs,lows)
+        hh_ll=smc.check_hh_ll(df4,bias)
 
-        score,breakdown,trigger=score_v4(
-            bias,active_ob,structure,has_sweep,
-            df1,df15,df4,pd_label,hh_ll,t_bull,t_bear
-        )
+        score,trig_label,is_engulf,has_trigger=score_signal(
+            bias,active_ob,structure,has_sweep,df1,df15,df4,pd_label,cfg)
 
-        min_sc=MIN_SCORE_SHORT if bias=='SHORT' else MIN_SCORE_LONG
-        if score<min_sc: return None,f'score_{score}_below_{min_sc}'
+        if cfg.get('require_trigger',False) and not has_trigger:
+            return None,f'no_trigger_sc{score}'
+
+        if cfg.get('require_engulf',False) and not is_engulf:
+            return None,f'no_engulf_trig_{trig_label}'
+
+        min_sc=cfg['min_score']
+        max_sc=cfg.get('max_score',100)
+        if score<min_sc: return None,f'score_{score}<{min_sc}'
+        if score>max_sc: return None,f'score_{score}>{max_sc}'
 
         atr1=float(df1['atr'].iloc[-1])
         entry=price
@@ -411,16 +378,14 @@ def detect_signal(df4, df1, df15):
         else [entry-risk*TP1_RR,entry-risk*TP2_RR,entry-risk*TP3_RR]
 
         return {
-            'bias':bias,'score':score,'breakdown':breakdown,
-            'trigger':trigger,'t_ema_bull':t_bull,'t_ema_bear':t_bear,
-            'hh_ll':hh_ll,'entry':entry,'sl':sl,'tps':tps,'risk':risk,
+            'bias':bias,'score':score,'trigger':trig_label,'is_engulf':is_engulf,
+            'has_trigger':has_trigger,'hh_ll':hh_ll,'has_sweep':has_sweep,
+            'entry':entry,'sl':sl,'tps':tps,'risk':risk,
             'risk_pct':risk/entry*100,
             'ob_size_pct':active_ob.get('size_pct',2.0),
-            'has_sweep':has_sweep,'pd_zone':pd_label,'pd_pos':round(pd_pos,3),
+            'pd_zone':pd_label,'pd_pos':round(pd_pos,3),
             'structure':structure['kind'] if structure else 'NONE',
-            'trend_pts':breakdown['trend'],'ob_pts':breakdown['ob_quality'],
-            'struct_pts':breakdown['structure'],'trigger_pts':breakdown['trigger'],
-            'mom_pts':breakdown['momentum'],'extra_pts':breakdown['extras'],
+            'adx':round(adx_val,1),
         },'passed'
 
     except Exception as e:
@@ -435,7 +400,7 @@ def simulate(sig, future):
     tp_hit=[False,False,False]; remaining=1.0; realized_r=0.0; outcome='TIMEOUT'
     weights=[TP1_CLOSE,TP2_CLOSE,TP3_CLOSE]; max_mae=0.0; bars_used=len(future)
 
-    for bn,(i,row) in enumerate(future.iterrows()):
+    for bn,(_,row) in enumerate(future.iterrows()):
         h,l=row['high'],row['low']
         mae=(entry-l)/risk if bias=='LONG' else (h-entry)/risk
         max_mae=max(max_mae,mae)
@@ -474,23 +439,20 @@ async def fetch(exchange, symbol, days_back):
         await asyncio.sleep(0.12)
     return result
 
-def walk_forward(data, symbol, days_back):
+def walk_forward(data, symbol, days_back, cfg):
     df4=data['4h']; df1=data['1h']; df15=data['15m']
     end_dt=df1['ts'].iloc[-1]; start_dt=end_dt-timedelta(days=days_back)
     test_idx=df1[df1['ts']>=start_dt].index.tolist()
-
-    trades=[]; rejects={}; last_sig=-999; active_end=-1
-
-    print(f"  {symbol}: {len(test_idx)} bars ...", end=' ', flush=True)
+    trades=[]; rejects=defaultdict(int); last_sig=-999; active_end=-1
 
     for idx in test_idx:
-        if idx<100 or idx<=active_end or idx-last_sig<MIN_BARS_BETWEEN_SIGNALS: continue
+        if idx<100 or idx<=active_end or idx-last_sig<MIN_BARS_BETWEEN: continue
         df1_s=df1.iloc[:idx+1]; ts=df1_s['ts'].iloc[-1]
         df4_s=df4[df4['ts']<=ts]; df15_s=df15[df15['ts']<=ts]
         if len(df4_s)<60 or len(df15_s)<40: continue
 
-        sig,reason=detect_signal(df4_s,df1_s,df15_s)
-        rejects[reason]=rejects.get(reason,0)+1
+        sig,reason=detect(df4_s,df1_s,df15_s,cfg)
+        rejects[reason]+=1
         if sig is None: continue
 
         future=df1.iloc[idx+1:idx+1+TRADE_TIMEOUT_H].copy()
@@ -501,15 +463,13 @@ def walk_forward(data, symbol, days_back):
 
         trades.append({
             'symbol':symbol,'date':ts.strftime('%Y-%m-%d %H:%M'),
+            'config':cfg['name'],
             'direction':sig['bias'],'score':sig['score'],
-            'trigger':sig['trigger'],'hh_ll':sig['hh_ll'],
-            't_ema_bull':sig['t_ema_bull'],'t_ema_bear':sig['t_ema_bear'],
+            'trigger':sig['trigger'],'is_engulf':sig['is_engulf'],
+            'hh_ll':sig['hh_ll'],'has_sweep':sig['has_sweep'],
             'pd_zone':sig['pd_zone'],'structure':sig['structure'],
             'ob_size_pct':round(sig['ob_size_pct'],3),
-            'has_sweep':sig['has_sweep'],
-            'trend_pts':sig['trend_pts'],'ob_pts':sig['ob_pts'],
-            'struct_pts':sig['struct_pts'],'trigger_pts':sig['trigger_pts'],
-            'mom_pts':sig['mom_pts'],'extra_pts':sig['extra_pts'],
+            'adx':sig['adx'],
             'entry':round(sig['entry'],6),'sl':round(sig['sl'],6),
             'tp1':round(sig['tps'][0],6),'tp2':round(sig['tps'][1],6),'tp3':round(sig['tps'][2],6),
             'risk_pct':round(sig['risk_pct'],3),
@@ -518,28 +478,15 @@ def walk_forward(data, symbol, days_back):
             'max_adverse_r':res['max_adverse_r'],'bars_held':res['bars_held'],
         })
 
-    top=sorted(rejects.items(),key=lambda x:-x[1])[:5]
-    rstr=' | '.join(f'{k}={v}' for k,v in top if k!='passed')
-    print(f"{len(trades)} signals | {rstr}")
-    return trades
+    return trades, dict(rejects)
 
 
 # ══════════════════════════════════════════════════════════════
 #  REPORT
 # ══════════════════════════════════════════════════════════════
-def make_report(trades):
-    df=pd.DataFrame(trades)
-    sep="═"*64
-    L=[sep,"  SMC PRO v4 — DATA-DRIVEN BACKTEST REPORT",
-       f"  {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
-       f"  {DAYS_BACK}d | {len(PAIRS)} pairs | SHORT≥{MIN_SCORE_SHORT} LONG≥{MIN_SCORE_LONG}",
-       f"  OB tol={OB_TOLERANCE_PCT*100:.1f}% lookback={OB_LOOKBACK} viol_window={OB_VIOLATION_WINDOW}",
-       sep]
-
-    if df.empty:
-        L.append("\n  ❌ 0 trades. Filters still too strict or market had no setups.")
-        L.append(sep); return "\n".join(L),df
-
+def section(df, label, lines, total_days=90, n_pairs=15):
+    if len(df)==0:
+        lines.append(f"\n  {label}: 0 trades"); return
     total=len(df); wins=df['won'].sum(); wr=wins/total*100
     avg_r=df['realized_r'].mean(); total_r=df['realized_r'].sum()
     run=0; peak=0; max_dd=0
@@ -549,72 +496,83 @@ def make_report(trades):
         dd=peak-run
         if dd>max_dd: max_dd=dd
 
-    L+=[f"\n  OVERALL ({total} trades)",f"  {'─'*46}",
-        f"  WR:          {wr:.1f}%  ({int(wins)}W / {total-int(wins)}L)",
-        f"  Avg R:       {avg_r:+.3f}R",
-        f"  Total R:     {total_r:+.2f}R",
-        f"  Max DD:      -{max_dd:.2f}R",
-        f"  Signals/wk:  {total/(DAYS_BACK/7):.1f}"]
+    lines+=[f"\n  ┌─ {label} ({total} trades) ─────────────────────────",
+            f"  │  WR:         {wr:.1f}%  ({int(wins)}W / {total-int(wins)}L)",
+            f"  │  Avg R:      {avg_r:+.3f}R",
+            f"  │  Total R:    {total_r:+.2f}R",
+            f"  │  Max DD:     -{max_dd:.2f}R",
+            f"  │  Per week:   {total/(total_days/7):.1f}"]
 
-    L+=[f"\n  BY DIRECTION",f"  {'─'*46}"]
+    lines.append(f"  │  Scores:  ",)
+    for lo,hi in [(55,64),(65,69),(70,74),(75,79),(80,100)]:
+        s=df[(df['score']>=lo)&(df['score']<=hi)]
+        if len(s): w2=s['won'].sum(); lines.append(f"  │    {lo}-{hi}: {len(s):>2}t WR={w2/len(s)*100:.0f}% avg={s['realized_r'].mean():+.2f}R")
+
+    lines.append(f"  │  Triggers:")
+    for trig in sorted(df['trigger'].unique()):
+        s=df[df['trigger']==trig]; w2=s['won'].sum()
+        lines.append(f"  │    {trig:<22}: {len(s):>2}t WR={w2/len(s)*100:.0f}% avg={s['realized_r'].mean():+.2f}R")
+
+    lines.append(f"  │  Outcomes:")
+    for out in ['TP3','TP2','TP1','PARTIAL_TP','SL','TIMEOUT']:
+        n=len(df[df['outcome']==out])
+        if n: lines.append(f"  │    {out:<12}: {n:>2} ({n/total*100:.0f}%)")
+
+    lines.append(f"  │  ADX analysis:")
+    for lo,hi in [(0,19),(20,24),(25,29),(30,49),(50,100)]:
+        s=df[(df['adx']>=lo)&(df['adx']<=hi)]
+        if len(s): w2=s['won'].sum(); lines.append(f"  │    ADX {lo}-{hi}: {len(s):>2}t WR={w2/len(s)*100:.0f}% avg={s['realized_r'].mean():+.2f}R")
+
+    lines.append(f"  └────────────────────────────────────────────────────")
+
+def make_report(all_trades):
+    df=pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
+    sep="═"*66
+    L=[sep, "  SMC PRO v5 — MULTI-CONFIG BACKTEST REPORT",
+       f"  {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
+       f"  {DAYS_BACK}d | {len(PAIRS)} pairs", sep]
+
+    if df.empty:
+        L.append("\n  ❌ 0 trades across all configs."); L.append(sep)
+        return "\n".join(L), df
+
+    for cfg in [CFG_A,CFG_B,CFG_C]:
+        sub=df[df['config']==cfg['name']]
+        section(sub, cfg['name'], L)
+
+    # Direction breakdown
+    L+=[f"\n  DIRECTION SUMMARY (all configs)",f"  {'─'*50}"]
     for d in ['LONG','SHORT']:
         s=df[df['direction']==d]
         if len(s)==0: continue
         w=s['won'].sum()
         L.append(f"  {d}: {len(s):>3}t | WR={w/len(s)*100:.1f}% | avg={s['realized_r'].mean():+.3f}R | total={s['realized_r'].sum():+.2f}R")
 
-    L+=[f"\n  SCORE BUCKETS",f"  {'─'*46}"]
-    for lo,hi in [(0,54),(55,59),(60,64),(65,69),(70,74),(75,79),(80,84),(85,100)]:
-        s=df[(df['score']>=lo)&(df['score']<=hi)]
-        if len(s)==0: continue
-        w=s['won'].sum()
-        L.append(f"  {lo:>2}-{hi}: {len(s):>3}t | WR={w/len(s)*100:.1f}% | avg={s['realized_r'].mean():+.3f}R")
-
-    L+=[f"\n  TRIGGER TYPE ANALYSIS",f"  {'─'*46}"]
-    for trig in df['trigger'].unique():
-        s=df[df['trigger']==trig]
-        w=s['won'].sum()
+    # Best trigger across all
+    L+=[f"\n  TRIGGER PERFORMANCE (all configs)",f"  {'─'*50}"]
+    for trig in sorted(df['trigger'].unique()):
+        s=df[df['trigger']==trig]; w=s['won'].sum()
         L.append(f"  {trig:<22}: {len(s):>3}t | WR={w/len(s)*100:.1f}% | avg={s['realized_r'].mean():+.3f}R")
 
-    L+=[f"\n  SCORE COMPONENT vs OUTCOME",f"  {'─'*46}"]
-    winners=df[df['won']==True]; losers=df[df['won']==False]
-    for col in ['trend_pts','ob_pts','struct_pts','trigger_pts','mom_pts','extra_pts']:
-        wm=winners[col].mean() if len(winners) else 0
-        lm=losers[col].mean() if len(losers) else 0
-        L.append(f"  {col:<15}: winners={wm:.1f}  losers={lm:.1f}  diff={wm-lm:+.1f}")
-
-    L+=[f"\n  OUTCOMES",f"  {'─'*46}"]
-    for out in ['TP3','TP2','TP1','PARTIAL_TP','SL','TIMEOUT']:
-        n=len(df[df['outcome']==out])
-        if n: L.append(f"  {out:<12}: {n:>3} ({n/total*100:.0f}%)")
-
-    L+=[f"\n  FILTER ANALYSIS",f"  {'─'*46}"]
-    for flag,label in [('hh_ll','HH/LL'),('t_ema_bull','TripleEMA_bull'),('has_sweep','Sweep')]:
-        y=df[df[flag]==True]; n2=df[df[flag]==False]
-        if len(y): L.append(f"  {label} YES {len(y):>3}t | WR={y['won'].sum()/len(y)*100:.1f}% | avg={y['realized_r'].mean():+.3f}R")
-        if len(n2): L.append(f"  {label} NO  {len(n2):>3}t | WR={n2['won'].sum()/len(n2)*100:.1f}% | avg={n2['realized_r'].mean():+.3f}R")
-
-    L+=[f"\n  PER PAIR",f"  {'─'*46}"]
+    # Per pair
+    L+=[f"\n  PER PAIR (all configs combined)",f"  {'─'*50}"]
     for sym in sorted(df['symbol'].unique()):
         s=df[df['symbol']==sym]; w=s['won'].sum()
         L.append(f"  {sym:<12}: {len(s):>3}t | WR={w/len(s)*100:.1f}% | avg={s['realized_r'].mean():+.3f}R")
 
-    L+=[f"\n{sep}",
-        "  FILES: smc_v4_results.csv | smc_v4_report.txt",
-        "  Share these to finalize the new strategy config.",sep]
-    return "\n".join(L),df
+    L+=[f"\n{sep}","  smc_v5_results.csv | smc_v5_report.txt",sep]
+    return "\n".join(L), df
 
 
 # ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 async def main():
-    print(f"\n{'═'*64}")
-    print(f"  SMC PRO — BACKTESTER v4 (data-driven rebuild)")
-    print(f"  Pairs={len(PAIRS)} | Days={DAYS_BACK}")
-    print(f"  Score: SHORT≥{MIN_SCORE_SHORT} | LONG≥{MIN_SCORE_LONG} + trend gate")
-    print(f"  OB: tol={OB_TOLERANCE_PCT*100:.1f}% lookback={OB_LOOKBACK} viol_win={OB_VIOLATION_WINDOW}")
-    print(f"{'═'*64}\n")
+    print(f"\n{'═'*66}")
+    print(f"  SMC PRO — BACKTESTER v5 (multi-config comparison)")
+    print(f"  Testing 3 configs: SHORT-ONLY | SWEET-SPOT | ENGULF-ONLY")
+    print(f"  {len(PAIRS)} pairs | {DAYS_BACK} days")
+    print(f"{'═'*66}\n")
 
     exchange=ccxt.binance({'enableRateLimit':True,'options':{'defaultType':'spot'}})
     all_trades=[]
@@ -623,23 +581,31 @@ async def main():
         print(f"⬇️  {sym} ...", end=' ', flush=True)
         try:
             data=await fetch(exchange,sym,DAYS_BACK)
-            t=walk_forward(data,sym,DAYS_BACK)
-            all_trades.extend(t)
+            for cfg in [CFG_A,CFG_B,CFG_C]:
+                t,_=walk_forward(data,sym,DAYS_BACK,cfg)
+                all_trades.extend(t)
+            df_sym=pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
+            cnts={}
+            for cfg in [CFG_A,CFG_B,CFG_C]:
+                c=df_sym[df_sym['config']==cfg['name']] if not df_sym.empty else pd.DataFrame()
+                sym_c=c[c['symbol']==sym] if not c.empty else pd.DataFrame()
+                cnts[cfg['name'].split('_')[1]]=len(sym_c)
+            print(f"A={cnts.get('A',0)} B={cnts.get('B',0)} C={cnts.get('C',0)}")
         except Exception as e:
             print(f"ERROR: {e}")
         await asyncio.sleep(0.5)
 
     await exchange.close()
-    print(f"\n{'─'*64}\n📊 Report...\n")
+    print(f"\n{'─'*66}\n📊 Report...\n")
 
     rpt,df=make_report(all_trades)
     print(rpt)
 
-    df.to_csv("smc_v4_results.csv",index=False)
-    print(f"\n✅ smc_v4_results.csv ({len(df)} trades)")
-    with open("smc_v4_report.txt","w") as f: f.write(rpt)
-    print(f"✅ smc_v4_report.txt")
-    print("\n💡 Share both files — final threshold tuning next.\n")
+    df.to_csv("smc_v5_results.csv",index=False)
+    print(f"\n✅ smc_v5_results.csv ({len(df)} trades)")
+    with open("smc_v5_report.txt","w") as f: f.write(rpt)
+    print(f"✅ smc_v5_report.txt")
+    print("\n💡 This is the final diagnostic. Share to get the rebuilt live bot.\n")
 
 if __name__=="__main__":
     asyncio.run(main())
