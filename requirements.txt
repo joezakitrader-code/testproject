@@ -1,5 +1,6 @@
-aiohttp
 ccxt
-numpy
+python-telegram-bot
 pandas
+numpy
 ta
+aiohttp
