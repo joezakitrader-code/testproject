@@ -54,10 +54,11 @@ TIER_COLORS = {'PREMIUM': '🔴', 'HIGH': '🟡', 'GOOD': '🟢'}
 
 class OBScanner:
     def __init__(self):
-        self.exchange  = ccxt.binanceusdm({
+        # Bybit — no geo-blocking, USDT perpetual futures, ccxt-compatible
+        self.exchange = ccxt.bybit({
             'enableRateLimit': True,
             'options': {
-                'fetchTickerMethod': 'fapiPublicGetTicker24hr',  # use futures endpoint
+                'defaultType': 'linear',  # USDT perpetual = linear on Bybit
                 'adjustForTimeDifference': True,
             }
         })
@@ -77,14 +78,14 @@ class OBScanner:
             tickers = await self.exchange.fetch_tickers()
             pairs = []
             for symbol, market in self.exchange.markets.items():
-                # binanceusdm: only perpetual USDT-margined futures
+                # Bybit linear: USDT perpetual swaps only
                 if not market.get('active', False):
                     continue
                 if market.get('quote') != 'USDT':
                     continue
-                if market.get('type') not in ('swap', 'future'):
+                if market.get('type') != 'swap':
                     continue
-                if market.get('expiry'):   # skip dated futures
+                if not market.get('linear', True):
                     continue
                 ticker = tickers.get(symbol, {}) or {}
                 vol = ticker.get('quoteVolume', 0) or 0
@@ -92,7 +93,7 @@ class OBScanner:
                     pairs.append((symbol, vol))
             pairs.sort(key=lambda x: x[1], reverse=True)
             selected = [p[0] for p in pairs[:TOP_N_PAIRS]]
-            logger.info(f"Found {len(selected)} pairs")
+            logger.info(f"Found {len(selected)} USDT perp pairs on Bybit")
             return selected
         except Exception as e:
             logger.error(f"get_top_pairs: {e}")
@@ -465,7 +466,7 @@ class OBScanner:
 
     async def run(self):
         logger.info("OB Scanner Bot v4 started")
-        logger.info(f"Pairs: {TOP_N_PAIRS} | OB_LENGTH: {OB_LENGTH} | Max Age: {OB_MAX_AGE}h")
+        logger.info(f"Pairs: {TOP_N_PAIRS} | OB_LENGTH: {OB_LENGTH} | Max Age: {OB_MAX_AGE}h | Exchange: Bybit")
         logger.info("TP1 hit = SL alert suppressed (protected trade)")
 
         while True:
