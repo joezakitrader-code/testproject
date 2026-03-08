@@ -7,7 +7,7 @@ import asyncio
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import ta
 import logging
 from telegram import Bot
@@ -54,7 +54,13 @@ TIER_COLORS = {'PREMIUM': '🔴', 'HIGH': '🟡', 'GOOD': '🟢'}
 
 class OBScanner:
     def __init__(self):
-        self.exchange  = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+        self.exchange  = ccxt.binanceusdm({
+            'enableRateLimit': True,
+            'options': {
+                'fetchTickerMethod': 'fapiPublicGetTicker24hr',  # use futures endpoint
+                'adjustForTimeDifference': True,
+            }
+        })
         self.bot       = Bot(token=TELEGRAM_TOKEN)
         self.cooldowns = {}   # symbol → datetime of last signal
         self.scan_count = 0
@@ -70,13 +76,24 @@ class OBScanner:
             await self.exchange.load_markets()
             tickers = await self.exchange.fetch_tickers()
             pairs = []
-            for symbol in self.exchange.symbols:
-                if symbol.endswith('/USDT:USDT') and 'PERP' not in symbol:
-                    vol = (tickers.get(symbol) or {}).get('quoteVolume', 0) or 0
-                    if vol > MIN_VOLUME_USDT:
-                        pairs.append((symbol, vol))
+            for symbol, market in self.exchange.markets.items():
+                # binanceusdm: only perpetual USDT-margined futures
+                if not market.get('active', False):
+                    continue
+                if market.get('quote') != 'USDT':
+                    continue
+                if market.get('type') not in ('swap', 'future'):
+                    continue
+                if market.get('expiry'):   # skip dated futures
+                    continue
+                ticker = tickers.get(symbol, {}) or {}
+                vol = ticker.get('quoteVolume', 0) or 0
+                if vol > MIN_VOLUME_USDT:
+                    pairs.append((symbol, vol))
             pairs.sort(key=lambda x: x[1], reverse=True)
-            return [p[0] for p in pairs[:TOP_N_PAIRS]]
+            selected = [p[0] for p in pairs[:TOP_N_PAIRS]]
+            logger.info(f"Found {len(selected)} pairs")
+            return selected
         except Exception as e:
             logger.error(f"get_top_pairs: {e}")
             return []
@@ -375,7 +392,7 @@ class OBScanner:
             f"✅ TP2    `{fmt(signal['tp2'])}` (3.0R)\n"
             f"✅ TP3    `{fmt(signal['tp3'])}` (5.0R)\n\n"
             f"📊 {struct} · {pd_str}\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M UTC')}"
+            f"⏰ {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M UTC')}"
         )
 
     # ─── SCAN ONE PAIR ──────────────────────────────────────
@@ -383,7 +400,7 @@ class OBScanner:
     async def scan_pair(self, symbol):
         try:
             last = self.cooldowns.get(symbol)
-            if last and (datetime.utcnow()-last).total_seconds() < COOLDOWN_HOURS*3600:
+            if last and (datetime.now(timezone.utc).replace(tzinfo=None)-last).total_seconds() < COOLDOWN_HOURS*3600:
                 return None
 
             df = await self.fetch_ohlcv(symbol, bars=300)
@@ -415,7 +432,7 @@ class OBScanner:
 
     async def run_scan(self):
         self.scan_count += 1
-        logger.info(f"Scan #{self.scan_count} | {datetime.utcnow().strftime('%H:%M UTC')}")
+        logger.info(f"Scan #{self.scan_count} | {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M UTC')}")
 
         # Monitor active trades first
         if self.active_trades:
@@ -428,7 +445,7 @@ class OBScanner:
             signal = await self.scan_pair(symbol)
             if signal:
                 signals.append((symbol, signal))
-                self.cooldowns[symbol] = datetime.utcnow()
+                self.cooldowns[symbol] = datetime.now(timezone.utc).replace(tzinfo=None)
                 # Register for TP/SL monitoring
                 self.active_trades[symbol] = {**signal, 'tp1_hit':False, 'tp2_hit':False, 'bars_open':0}
                 logger.info(f"Signal: {symbol} {signal['direction']} {signal['tier']}")
