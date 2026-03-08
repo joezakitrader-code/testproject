@@ -7,7 +7,7 @@ import asyncio
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import ta
 import logging
 from telegram import Bot
@@ -54,14 +54,7 @@ TIER_COLORS = {'PREMIUM': '🔴', 'HIGH': '🟡', 'GOOD': '🟢'}
 
 class OBScanner:
     def __init__(self):
-        # Bybit — no geo-blocking, USDT perpetual futures, ccxt-compatible
-        self.exchange = ccxt.bybit({
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'linear',  # USDT perpetual = linear on Bybit
-                'adjustForTimeDifference': True,
-            }
-        })
+        self.exchange  = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
         self.bot       = Bot(token=TELEGRAM_TOKEN)
         self.cooldowns = {}   # symbol → datetime of last signal
         self.scan_count = 0
@@ -77,24 +70,13 @@ class OBScanner:
             await self.exchange.load_markets()
             tickers = await self.exchange.fetch_tickers()
             pairs = []
-            for symbol, market in self.exchange.markets.items():
-                # Bybit linear: USDT perpetual swaps only
-                if not market.get('active', False):
-                    continue
-                if market.get('quote') != 'USDT':
-                    continue
-                if market.get('type') != 'swap':
-                    continue
-                if not market.get('linear', True):
-                    continue
-                ticker = tickers.get(symbol, {}) or {}
-                vol = ticker.get('quoteVolume', 0) or 0
-                if vol > MIN_VOLUME_USDT:
-                    pairs.append((symbol, vol))
+            for symbol in self.exchange.symbols:
+                if symbol.endswith('/USDT:USDT') and 'PERP' not in symbol:
+                    vol = (tickers.get(symbol) or {}).get('quoteVolume', 0) or 0
+                    if vol > MIN_VOLUME_USDT:
+                        pairs.append((symbol, vol))
             pairs.sort(key=lambda x: x[1], reverse=True)
-            selected = [p[0] for p in pairs[:TOP_N_PAIRS]]
-            logger.info(f"Found {len(selected)} USDT perp pairs on Bybit")
-            return selected
+            return [p[0] for p in pairs[:TOP_N_PAIRS]]
         except Exception as e:
             logger.error(f"get_top_pairs: {e}")
             return []
@@ -393,7 +375,7 @@ class OBScanner:
             f"✅ TP2    `{fmt(signal['tp2'])}` (3.0R)\n"
             f"✅ TP3    `{fmt(signal['tp3'])}` (5.0R)\n\n"
             f"📊 {struct} · {pd_str}\n"
-            f"⏰ {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M UTC')}"
+            f"⏰ {datetime.utcnow().strftime('%H:%M UTC')}"
         )
 
     # ─── SCAN ONE PAIR ──────────────────────────────────────
@@ -401,7 +383,7 @@ class OBScanner:
     async def scan_pair(self, symbol):
         try:
             last = self.cooldowns.get(symbol)
-            if last and (datetime.now(timezone.utc).replace(tzinfo=None)-last).total_seconds() < COOLDOWN_HOURS*3600:
+            if last and (datetime.utcnow()-last).total_seconds() < COOLDOWN_HOURS*3600:
                 return None
 
             df = await self.fetch_ohlcv(symbol, bars=300)
@@ -433,7 +415,7 @@ class OBScanner:
 
     async def run_scan(self):
         self.scan_count += 1
-        logger.info(f"Scan #{self.scan_count} | {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M UTC')}")
+        logger.info(f"Scan #{self.scan_count} | {datetime.utcnow().strftime('%H:%M UTC')}")
 
         # Monitor active trades first
         if self.active_trades:
@@ -446,7 +428,7 @@ class OBScanner:
             signal = await self.scan_pair(symbol)
             if signal:
                 signals.append((symbol, signal))
-                self.cooldowns[symbol] = datetime.now(timezone.utc).replace(tzinfo=None)
+                self.cooldowns[symbol] = datetime.utcnow()
                 # Register for TP/SL monitoring
                 self.active_trades[symbol] = {**signal, 'tp1_hit':False, 'tp2_hit':False, 'bars_open':0}
                 logger.info(f"Signal: {symbol} {signal['direction']} {signal['tier']}")
@@ -466,7 +448,7 @@ class OBScanner:
 
     async def run(self):
         logger.info("OB Scanner Bot v4 started")
-        logger.info(f"Pairs: {TOP_N_PAIRS} | OB_LENGTH: {OB_LENGTH} | Max Age: {OB_MAX_AGE}h | Exchange: Bybit")
+        logger.info(f"Pairs: {TOP_N_PAIRS} | OB_LENGTH: {OB_LENGTH} | Max Age: {OB_MAX_AGE}h")
         logger.info("TP1 hit = SL alert suppressed (protected trade)")
 
         while True:
