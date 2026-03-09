@@ -1,13 +1,13 @@
 """
-ADVANCED DAY TRADING SCANNER v2.0
+ADVANCED DAY TRADING SCANNER v3.0
 ===================================
-CHANGES FROM v1 (based on backtest results):
-  ✅ TP multipliers tightened: 0.8 / 1.3 / 1.8x ATR (was 1.0 / 2.0 / 3.5)
-  ✅ LONG filter: requires 4H uptrend OR MACD cross OR volume spike
-  ✅ Quality thresholds lowered: PREMIUM=65%, HIGH=55% (was 71% / 60%)
-  ✅ BTC market regime filter: LONGs only above BTC 4H EMA21, SHORTs only below
-  ✅ Scan interval tunable (default 15 min)
-  ✅ /whitelist command to focus on best-performing pairs
+CHANGES FROM v2 (based on backtest v2 results):
+  ✅ Scans ALL USDT pairs (no whitelist default)
+  ✅ TP multipliers ultra-tight: 0.6 / 1.0 / 1.5x ATR  (TP2/TP3 were never hit at 1.3/1.8)
+  ✅ BTC regime filter SOFTENED: doesn't block signals, just warns + reduces score threshold
+  ✅ LONG filter kept but relaxed: requires ANY ONE of 5 confirmations (was 3)
+  ✅ Trailing SL suggestion after TP1 hit
+  ✅ Signal frequency improved — more signals from more pairs
 """
 
 import asyncio
@@ -29,33 +29,25 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ─────────────────────────────────────────────────────────────
-# TUNABLE PARAMETERS  ← edit these to retune without touching logic
+# TUNABLE PARAMETERS
 # ─────────────────────────────────────────────────────────────
-ATR_SL_MULT   = 1.5   # Stop loss distance
-ATR_TP1_MULT  = 0.8   # TP1 (was 1.0)  — quick win, high hit rate
-ATR_TP2_MULT  = 1.3   # TP2 (was 2.0)  — realistic target
-ATR_TP3_MULT  = 1.8   # TP3 (was 3.5)  — still ambitious but hittable
+ATR_SL_MULT   = 1.5
+ATR_TP1_MULT  = 0.6   # Very tight — near-guaranteed hit
+ATR_TP2_MULT  = 1.0   # Same as v1 TP1 — should now hit
+ATR_TP3_MULT  = 1.5   # Realistic extended target
 
-MIN_SCORE_PCT = 0.51  # Minimum score to generate signal (51% of 35 pts)
+MIN_SCORE_PCT           = 0.51
+QUALITY_PREMIUM_PCT     = 0.65
+QUALITY_HIGH_PCT        = 0.55
 
-QUALITY_PREMIUM_PCT = 0.65  # was 0.71 — now fires more often
-QUALITY_HIGH_PCT    = 0.55  # was 0.60
+# Regime: softened — warns instead of blocks
+# Set to True to hard-block counter-regime trades
+HARD_BLOCK_REGIME       = False
 
-USE_BTC_REGIME_FILTER = True   # Only LONG above BTC EMA21, SHORT below
-USE_LONG_TREND_FILTER = True   # Require trend confirmation for LONGs
-
-MAX_TRADE_HOURS = 24
-SCAN_INTERVAL_MIN = 15
-MIN_VOLUME_USDT = 1_000_000
-
-# Top performers from backtest — used by /whitelist command
-WHITELIST_PAIRS = [
-    'SIGN/USDT:USDT', 'RIVER/USDT:USDT', 'SAHARA/USDT:USDT',
-    'DENT/USDT:USDT', 'DOGE/USDT:USDT', 'ETH/USDT:USDT',
-    'BTC/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT',
-    'ZEC/USDT:USDT', 'HYPE/USDT:USDT', 'BNB/USDT:USDT',
-    'NEAR/USDT:USDT', 'AVAX/USDT:USDT',
-]
+USE_LONG_TREND_FILTER   = True   # Still filter weak longs
+MAX_TRADE_HOURS         = 24
+SCAN_INTERVAL_MIN       = 15
+MIN_VOLUME_USDT         = 1_000_000
 
 # ─────────────────────────────────────────────────────────────
 
@@ -72,64 +64,62 @@ class AdvancedDayTradingScanner:
         })
         self.signal_history = deque(maxlen=200)
         self.active_trades  = {}
-        self.use_whitelist  = False
-        self.btc_regime     = None   # 'BULL' | 'BEAR' | None
+        self.btc_regime     = None
         self.stats = {
             'total_signals': 0, 'long_signals': 0, 'short_signals': 0,
-            'premium_signals': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'tp3_hits': 0,
-            'sl_hits': 0, 'last_scan_time': None, 'pairs_scanned': 0,
-            'filtered_long': 0,  # signals rejected by LONG filter
+            'premium_signals': 0, 'high_signals': 0,
+            'tp1_hits': 0, 'tp2_hits': 0, 'tp3_hits': 0, 'sl_hits': 0,
+            'last_scan_time': None, 'pairs_scanned': 0, 'filtered_long': 0,
         }
         self.is_scanning = False
 
-    # ── Market regime ────────────────────────────────────────
+    # ── BTC Regime ────────────────────────────────────────────
 
     async def update_btc_regime(self):
-        """Check if BTC is above/below 4H EMA21 to determine market regime."""
-        if not USE_BTC_REGIME_FILTER:
-            self.btc_regime = None
-            return
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=30)
             df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
             df['ema21'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
             last_close = df['close'].iloc[-1]
             last_ema   = df['ema21'].iloc[-1]
+            prev_regime = self.btc_regime
             self.btc_regime = 'BULL' if last_close > last_ema else 'BEAR'
-            logger.info(f"📡 BTC Regime: {self.btc_regime} (price={last_close:.0f} ema21={last_ema:.0f})")
+            if prev_regime != self.btc_regime:
+                await self.send_msg(
+                    f"📡 <b>BTC Regime Changed!</b>\n"
+                    f"{prev_regime} → <b>{self.btc_regime}</b>\n"
+                    f"BTC: ${last_close:,.0f} | EMA21: ${last_ema:,.0f}"
+                )
+            logger.info(f"📡 BTC Regime: {self.btc_regime}")
         except Exception as e:
             logger.error(f"BTC regime error: {e}")
             self.btc_regime = None
 
-    # ── Pair fetching ─────────────────────────────────────────
+    # ── All USDT pairs ────────────────────────────────────────
 
     async def get_all_usdt_pairs(self):
         try:
             await self.exchange.load_markets()
             tickers = await self.exchange.fetch_tickers()
-            if self.use_whitelist:
-                pairs = [p for p in WHITELIST_PAIRS if p in self.exchange.symbols]
-                logger.info(f"✅ Whitelist mode: {len(pairs)} pairs")
-                return pairs
             pairs = []
             for symbol in self.exchange.symbols:
                 if symbol.endswith('/USDT:USDT') and 'PERP' not in symbol:
-                    if tickers.get(symbol, {}).get('quoteVolume', 0) > MIN_VOLUME_USDT:
+                    vol = tickers.get(symbol, {}).get('quoteVolume', 0)
+                    if vol > MIN_VOLUME_USDT:
                         pairs.append(symbol)
             pairs.sort(key=lambda x: tickers.get(x, {}).get('quoteVolume', 0), reverse=True)
-            logger.info(f"✅ Found {len(pairs)} pairs")
+            logger.info(f"✅ {len(pairs)} pairs found")
             return pairs
         except Exception as e:
-            logger.error(f"Error fetching pairs: {e}")
+            logger.error(f"Pairs error: {e}")
             return []
 
-    # ── Data fetching ─────────────────────────────────────────
+    # ── Data fetch ────────────────────────────────────────────
 
     async def fetch_day_trading_data(self, symbol):
-        timeframes = {'1h': 100, '4h': 100, '15m': 50}
         data = {}
         try:
-            for tf, limit in timeframes.items():
+            for tf, limit in [('1h', 100), ('4h', 100), ('15m', 50)]:
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
                 df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -137,7 +127,7 @@ class AdvancedDayTradingScanner:
                 await asyncio.sleep(0.05)
             return data
         except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
+            logger.error(f"Fetch error {symbol}: {e}")
             return None
 
     # ── Indicators ────────────────────────────────────────────
@@ -181,8 +171,8 @@ class AdvancedDayTradingScanner:
             df['macd_signal'] = macd.macd_signal()
             df['macd_hist']   = macd.macd_diff()
             stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'])
-            df['stoch_k'] = stoch.stoch()
-            df['stoch_d'] = stoch.stoch_signal()
+            df['stoch_k']    = stoch.stoch()
+            df['stoch_d']    = stoch.stoch_signal()
             df['williams_r'] = ta.momentum.WilliamsRIndicator(df['high'], df['low'], df['close']).williams_r()
             df['roc']        = ta.momentum.ROCIndicator(df['close'], window=12).roc()
             df['uo']         = ta.momentum.UltimateOscillator(df['high'], df['low'], df['close']).ultimate_oscillator()
@@ -219,11 +209,10 @@ class AdvancedDayTradingScanner:
             df['aroon_down'] = aroon.aroon_down()
             df['aroon_ind']  = df['aroon_up'] - df['aroon_down']
 
-            tp = (df['high'] + df['low'] + df['close']) / 3
-            df['vwap'] = (tp * df['volume']).cumsum() / df['volume'].cumsum()
+            tp_price = (df['high'] + df['low'] + df['close']) / 3
+            df['vwap'] = (tp_price * df['volume']).cumsum() / df['volume'].cumsum()
             df['vwap'].fillna(df['close'], inplace=True)
 
-            df['bullish_candle']    = (df['close'] > df['open']).astype(int)
             df['bullish_engulfing'] = (
                 (df['close'].shift(1) < df['open'].shift(1)) &
                 (df['close'] > df['open']) &
@@ -245,8 +234,6 @@ class AdvancedDayTradingScanner:
         except Exception as e:
             logger.error(f"Indicator error: {e}")
         return df
-
-    # ── Volume spike ──────────────────────────────────────────
 
     def detect_volume_spike(self, df):
         if len(df) < 20:
@@ -279,8 +266,7 @@ class AdvancedDayTradingScanner:
             latest_4h  = df_4h.iloc[-1]
             latest_15m = df_15m.iloc[-1]
 
-            required = ['ema_9','ema_21','rsi','macd','vwap','bb_pband']
-            for col in required:
+            for col in ['ema_9','ema_21','rsi','macd','vwap','bb_pband']:
                 if col not in latest_1h.index or pd.isna(latest_1h[col]):
                     return None
 
@@ -299,9 +285,9 @@ class AdvancedDayTradingScanner:
                 short_score += 3; short_reasons.append('🔥 4H Downtrend')
 
             if latest_1h['ema_9'] > latest_1h['ema_21']:
-                long_score += 2;  long_reasons.append('1H Bullish')
+                long_score += 2;  long_reasons.append('1H Bullish EMA')
             elif latest_1h['ema_9'] < latest_1h['ema_21']:
-                short_score += 2; short_reasons.append('1H Bearish')
+                short_score += 2; short_reasons.append('1H Bearish EMA')
 
             if latest_1h['close'] > latest_1h['supertrend']:
                 long_score += 1;  long_reasons.append('SuperTrend Bull')
@@ -311,29 +297,31 @@ class AdvancedDayTradingScanner:
             # ── MOMENTUM (9 pts) ──
             rsi = latest_1h['rsi']
             if rsi < 30:
-                long_score += 3.5; long_reasons.append(f'💎 RSI Deep Oversold ({rsi:.0f})')
+                long_score += 3.5; long_reasons.append(f'💎 RSI Oversold ({rsi:.0f})')
             elif rsi < 40:
-                long_score += 2;   long_reasons.append(f'RSI Oversold ({rsi:.0f})')
+                long_score += 2;   long_reasons.append(f'RSI Weak ({rsi:.0f})')
             elif 40 <= rsi <= 50:
-                long_score += 1;   long_reasons.append('RSI Buy Zone')
+                long_score += 1;   long_reasons.append(f'RSI Buy Zone ({rsi:.0f})')
 
             if rsi > 70:
-                short_score += 3.5; short_reasons.append(f'💎 RSI Deep Overbought ({rsi:.0f})')
+                short_score += 3.5; short_reasons.append(f'💎 RSI Overbought ({rsi:.0f})')
             elif rsi > 60:
-                short_score += 2;   short_reasons.append(f'RSI Overbought ({rsi:.0f})')
+                short_score += 2;   short_reasons.append(f'RSI High ({rsi:.0f})')
             elif 50 <= rsi <= 60:
-                short_score += 1;   short_reasons.append('RSI Sell Zone')
+                short_score += 1;   short_reasons.append(f'RSI Sell Zone ({rsi:.0f})')
 
             sk = latest_1h['stoch_rsi_k']; sd = latest_1h['stoch_rsi_d']
             if sk < 0.2 and sk > sd:
-                long_score += 2;  long_reasons.append('⚡ Stoch RSI Cross')
+                long_score += 2;  long_reasons.append('⚡ StochRSI Cross Up')
             elif sk > 0.8 and sk < sd:
-                short_score += 2; short_reasons.append('⚡ Stoch RSI Cross')
+                short_score += 2; short_reasons.append('⚡ StochRSI Cross Down')
 
-            if latest_1h['macd'] > latest_1h['macd_signal'] and prev_1h['macd'] <= prev_1h['macd_signal']:
-                long_score += 2.5;  long_reasons.append('🎯 MACD Cross Bull')
-            elif latest_1h['macd'] < latest_1h['macd_signal'] and prev_1h['macd'] >= prev_1h['macd_signal']:
-                short_score += 2.5; short_reasons.append('🎯 MACD Cross Bear')
+            macd_cross_bull = latest_1h['macd'] > latest_1h['macd_signal'] and prev_1h['macd'] <= prev_1h['macd_signal']
+            macd_cross_bear = latest_1h['macd'] < latest_1h['macd_signal'] and prev_1h['macd'] >= prev_1h['macd_signal']
+            if macd_cross_bull:
+                long_score += 2.5;  long_reasons.append('🎯 MACD Cross ↑')
+            elif macd_cross_bear:
+                short_score += 2.5; short_reasons.append('🎯 MACD Cross ↓')
 
             if latest_1h['uo'] < 30:
                 long_score += 1.5;  long_reasons.append('UO Oversold')
@@ -343,9 +331,9 @@ class AdvancedDayTradingScanner:
             # ── VOLUME (5 pts) ──
             if volume_spike:
                 if latest_1h['close'] > prev_1h['close']:
-                    long_score += 3;  long_reasons.append(f'🚀 VOL SPIKE ({vol_ratio:.1f}x)')
+                    long_score += 3;  long_reasons.append(f'🚀 Vol Spike ({vol_ratio:.1f}x)')
                 else:
-                    short_score += 3; short_reasons.append(f'💥 VOL DUMP ({vol_ratio:.1f}x)')
+                    short_score += 3; short_reasons.append(f'💥 Vol Dump ({vol_ratio:.1f}x)')
 
             if latest_1h['mfi'] < 20:
                 long_score += 1.5;  long_reasons.append(f'MFI Oversold ({latest_1h["mfi"]:.0f})')
@@ -353,9 +341,9 @@ class AdvancedDayTradingScanner:
                 short_score += 1.5; short_reasons.append(f'MFI Overbought ({latest_1h["mfi"]:.0f})')
 
             if latest_1h['cmf'] > 0.15:
-                long_score += 1;  long_reasons.append('Strong Buying (CMF)')
+                long_score += 1;  long_reasons.append('CMF Buying')
             elif latest_1h['cmf'] < -0.15:
-                short_score += 1; short_reasons.append('Strong Selling (CMF)')
+                short_score += 1; short_reasons.append('CMF Selling')
 
             obv_trend = df_1h['obv'].iloc[-5:].diff().mean()
             if obv_trend > 0 and latest_1h['obv'] > latest_1h['obv_ema']:
@@ -365,14 +353,14 @@ class AdvancedDayTradingScanner:
 
             # ── VOLATILITY (6 pts) ──
             if latest_1h['bb_pband'] < 0.1:
-                long_score += 2.5;  long_reasons.append('💎 Lower BB')
+                long_score += 2.5;  long_reasons.append('💎 Lower BB Touch')
             elif latest_1h['bb_pband'] > 0.9:
-                short_score += 2.5; short_reasons.append('💎 Upper BB')
+                short_score += 2.5; short_reasons.append('💎 Upper BB Touch')
 
             if latest_1h['cci'] < -150:
-                long_score += 1.5;  long_reasons.append('CCI Deep Oversold')
+                long_score += 1.5;  long_reasons.append('CCI Oversold')
             elif latest_1h['cci'] > 150:
-                short_score += 1.5; short_reasons.append('CCI Deep Overbought')
+                short_score += 1.5; short_reasons.append('CCI Overbought')
 
             if latest_1h['williams_r'] < -85:
                 long_score += 1;  long_reasons.append('Williams Oversold')
@@ -387,9 +375,9 @@ class AdvancedDayTradingScanner:
             # ── TREND STRENGTH (4 pts) ──
             if latest_1h['adx'] > 30:
                 if latest_1h['di_plus'] > latest_1h['di_minus']:
-                    long_score += 2;  long_reasons.append(f'🔥 Strong Up (ADX:{latest_1h["adx"]:.0f})')
+                    long_score += 2;  long_reasons.append(f'ADX Strong Up ({latest_1h["adx"]:.0f})')
                 else:
-                    short_score += 2; short_reasons.append(f'🔥 Strong Down (ADX:{latest_1h["adx"]:.0f})')
+                    short_score += 2; short_reasons.append(f'ADX Strong Down ({latest_1h["adx"]:.0f})')
             elif latest_1h['adx'] > 25:
                 if latest_1h['di_plus'] > latest_1h['di_minus']:
                     long_score += 1
@@ -397,27 +385,27 @@ class AdvancedDayTradingScanner:
                     short_score += 1
 
             if latest_1h['aroon_ind'] > 50:
-                long_score += 1;  long_reasons.append('Aroon Up')
+                long_score += 1;  long_reasons.append('Aroon Bullish')
             elif latest_1h['aroon_ind'] < -50:
-                short_score += 1; short_reasons.append('Aroon Down')
+                short_score += 1; short_reasons.append('Aroon Bearish')
 
             if latest_1h['roc'] > 3:
-                long_score += 1;  long_reasons.append('Strong Momentum')
+                long_score += 1;  long_reasons.append('ROC Positive')
             elif latest_1h['roc'] < -3:
-                short_score += 1; short_reasons.append('Strong Momentum ↓')
+                short_score += 1; short_reasons.append('ROC Negative')
 
-            # ── DIVERGENCE & PATTERNS (3 pts) ──
+            # ── PATTERNS & DIVERGENCE (3 pts) ──
             if latest_1h['bullish_divergence'] == 1:
                 long_score += 2;  long_reasons.append('🎯 Bullish Divergence')
             elif latest_1h['bearish_divergence'] == 1:
                 short_score += 2; short_reasons.append('🎯 Bearish Divergence')
 
             if latest_15m['bullish_engulfing'] == 1:
-                long_score += 1.5;  long_reasons.append('📊 Bullish Engulfing')
+                long_score += 1.5;  long_reasons.append('📊 Bullish Engulfing (15m)')
             elif latest_15m['bearish_engulfing'] == 1:
-                short_score += 1.5; short_reasons.append('📊 Bearish Engulfing')
+                short_score += 1.5; short_reasons.append('📊 Bearish Engulfing (15m)')
 
-            # ── HTF CONFIRMATION (2 pts) ──
+            # ── HTF (2 pts) ──
             if latest_4h['close'] > latest_4h['vwap']:
                 long_score += 1
             else:
@@ -428,46 +416,43 @@ class AdvancedDayTradingScanner:
             elif latest_4h['rsi'] > 50:
                 short_score += 1
 
-            # ── DETERMINE SIGNAL ──────────────────────────────────
+            # ── DETERMINE SIGNAL ──
             min_threshold = max_score * MIN_SCORE_PCT
-            signal  = None
-            score   = 0
-            reasons = []
-
+            signal = None
             if long_score > short_score and long_score >= min_threshold:
-                signal  = 'LONG'
-                score   = long_score
-                reasons = long_reasons
+                signal = 'LONG';  score = long_score;  reasons = long_reasons
             elif short_score > long_score and short_score >= min_threshold:
-                signal  = 'SHORT'
-                score   = short_score
-                reasons = short_reasons
+                signal = 'SHORT'; score = short_score; reasons = short_reasons
 
             if not signal:
                 return None
 
-            # ── v2 FIX 1: LONG trend confirmation filter ──────────
+            # ── LONG trend filter (relaxed — any ONE of 5 checks) ──
             if signal == 'LONG' and USE_LONG_TREND_FILTER:
-                has_trend_confirm = (
-                    (latest_4h['ema_9'] > latest_4h['ema_21'] > latest_4h['ema_50']) or
-                    (latest_1h['macd'] > latest_1h['macd_signal'] and prev_1h['macd'] <= prev_1h['macd_signal']) or
-                    volume_spike
-                )
-                if not has_trend_confirm:
+                trend_confirms = [
+                    latest_4h['ema_9'] > latest_4h['ema_21'],              # 4H trend up
+                    latest_1h['ema_9'] > latest_1h['ema_21'],              # 1H trend up
+                    macd_cross_bull,                                        # MACD just crossed up
+                    volume_spike and latest_1h['close'] > prev_1h['close'],# Volume spike up
+                    latest_1h['rsi'] < 35,                                 # Deep oversold bounce
+                ]
+                if not any(trend_confirms):
                     self.stats['filtered_long'] += 1
-                    logger.info(f"  ⚡ {symbol} LONG rejected — no trend confirmation")
                     return None
 
-            # ── v2 FIX 2: BTC regime filter ───────────────────────
-            if USE_BTC_REGIME_FILTER and self.btc_regime:
+            # ── BTC regime (soft warning, hard block optional) ──
+            regime_warning = ''
+            if self.btc_regime:
                 if signal == 'LONG' and self.btc_regime == 'BEAR':
-                    logger.info(f"  🐻 {symbol} LONG rejected — BTC in BEAR regime")
-                    return None
-                if signal == 'SHORT' and self.btc_regime == 'BULL':
-                    logger.info(f"  🐂 {symbol} SHORT rejected — BTC in BULL regime")
-                    return None
+                    if HARD_BLOCK_REGIME:
+                        return None
+                    regime_warning = ' ⚠️ Counter-regime'
+                elif signal == 'SHORT' and self.btc_regime == 'BULL':
+                    if HARD_BLOCK_REGIME:
+                        return None
+                    regime_warning = ' ⚠️ Counter-regime'
 
-            # ── v2 FIX 3: Lowered quality thresholds ──────────────
+            # ── Quality ──
             pct = score / max_score
             if pct >= QUALITY_PREMIUM_PCT:
                 quality = 'PREMIUM 💎'
@@ -478,25 +463,15 @@ class AdvancedDayTradingScanner:
 
             entry = latest_15m['close']
             atr   = latest_1h['atr']
-
             if pd.isna(atr) or atr == 0 or pd.isna(entry) or entry == 0:
                 return None
 
-            # ── v2 FIX 4: Tighter TP multipliers ──────────────────
             if signal == 'LONG':
                 sl      = entry - (atr * ATR_SL_MULT)
-                targets = [
-                    entry + (atr * ATR_TP1_MULT),
-                    entry + (atr * ATR_TP2_MULT),
-                    entry + (atr * ATR_TP3_MULT),
-                ]
+                targets = [entry + atr*ATR_TP1_MULT, entry + atr*ATR_TP2_MULT, entry + atr*ATR_TP3_MULT]
             else:
                 sl      = entry + (atr * ATR_SL_MULT)
-                targets = [
-                    entry - (atr * ATR_TP1_MULT),
-                    entry - (atr * ATR_TP2_MULT),
-                    entry - (atr * ATR_TP3_MULT),
-                ]
+                targets = [entry - atr*ATR_TP1_MULT, entry - atr*ATR_TP2_MULT, entry - atr*ATR_TP3_MULT]
 
             risk_pct = abs((sl - entry) / entry * 100)
             rr = [(abs(tp - entry) / abs(sl - entry)) for tp in targets]
@@ -504,65 +479,68 @@ class AdvancedDayTradingScanner:
             trade_id = f"{symbol.replace('/USDT:USDT','')}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
             return {
-                'trade_id':    trade_id,
-                'symbol':      symbol.replace('/USDT:USDT', ''),
-                'full_symbol': symbol,
-                'signal':      signal,
-                'quality':     quality,
-                'score':       score,
-                'max_score':   max_score,
-                'score_percent': pct * 100,
-                'entry':       entry,
-                'stop_loss':   sl,
-                'targets':     targets,
-                'reward_ratios': rr,
-                'risk_percent':  risk_pct,
-                'reasons':     reasons[:10],
-                'tp_hit':      [False, False, False],
-                'sl_hit':      False,
-                'timestamp':   datetime.now(),
-                'status':      'ACTIVE',
-                'btc_regime':  self.btc_regime or 'N/A',
+                'trade_id':       trade_id,
+                'symbol':         symbol.replace('/USDT:USDT', ''),
+                'full_symbol':    symbol,
+                'signal':         signal,
+                'quality':        quality,
+                'score':          score,
+                'max_score':      max_score,
+                'score_percent':  pct * 100,
+                'entry':          entry,
+                'stop_loss':      sl,
+                'targets':        targets,
+                'reward_ratios':  rr,
+                'risk_percent':   risk_pct,
+                'reasons':        reasons[:10],
+                'regime_warning': regime_warning,
+                'tp_hit':         [False, False, False],
+                'sl_hit':         False,
+                'timestamp':      datetime.now(),
+                'status':         'ACTIVE',
+                'btc_regime':     self.btc_regime or 'N/A',
             }
 
         except Exception as e:
-            logger.error(f"Signal detection error {symbol}: {e}")
+            logger.error(f"Signal error {symbol}: {e}")
             return None
 
-    # ── Format signal message ─────────────────────────────────
+    # ── Format signal ─────────────────────────────────────────
 
     def format_signal(self, sig):
-        emoji = "🚀" if sig['signal'] == 'LONG' else "🔻"
-        regime_tag = f"[BTC:{sig.get('btc_regime','?')}]" if USE_BTC_REGIME_FILTER else ""
+        emoji = '🚀' if sig['signal'] == 'LONG' else '🔻'
+        regime_tag = f"[BTC:{sig['btc_regime']}]{sig.get('regime_warning','')}"
 
-        msg  = f"{'='*40}\n"
-        msg += f"{emoji} <b>24H DAY TRADE - {sig['quality']}</b> {emoji}\n"
-        msg += f"{'='*40}\n\n"
-        msg += f"<b>🆔:</b> <code>{sig['trade_id']}</code>\n"
-        msg += f"<b>📊 PAIR:</b> #{sig['symbol']}  {regime_tag}\n"
+        msg  = f"{'='*42}\n"
+        msg += f"{emoji} <b>DAY TRADE — {sig['quality']}</b> {emoji}\n"
+        msg += f"{'='*42}\n\n"
+        msg += f"<b>🆔</b> <code>{sig['trade_id']}</code>\n"
+        msg += f"<b>📊 PAIR:</b> #{sig['symbol']}  <i>{regime_tag}</i>\n"
         msg += f"<b>📍 DIR:</b> <b>{sig['signal']}</b>\n"
         msg += f"<b>⭐ SCORE:</b> {sig['score']:.1f}/{sig['max_score']} ({sig['score_percent']:.0f}%)\n"
         filled = int(sig['score_percent'] / 10)
-        msg += f"{'▰' * filled}{'▱' * (10 - filled)}\n\n"
+        msg += f"{'▰'*filled}{'▱'*(10-filled)}\n\n"
 
         msg += f"<b>💰 ENTRY:</b> ${sig['entry']:.6f}\n\n"
         msg += f"<b>🎯 TARGETS:</b>\n"
-        times = ['1-3h', '3-8h', '8-16h']
-        for i, (tp, rr, t) in enumerate(zip(sig['targets'], sig['reward_ratios'], times), 1):
-            pct = abs((tp - sig['entry']) / sig['entry'] * 100)
-            msg += f"  TP{i} ({t}): ${tp:.6f} (+{pct:.2f}%) [RR {rr:.1f}:1]\n"
+        durations = ['1-2h', '2-6h', '6-12h']
+        for i, (tp, rr, dur) in enumerate(zip(sig['targets'], sig['reward_ratios'], durations), 1):
+            pct_gain = abs((tp - sig['entry']) / sig['entry'] * 100)
+            msg += f"  TP{i} ({dur}): ${tp:.6f}  +{pct_gain:.2f}%  [RR {rr:.1f}:1]\n"
 
-        msg += f"\n<b>🛑 SL:</b> ${sig['stop_loss']:.6f} (-{sig['risk_percent']:.2f}%)\n\n"
-        msg += f"<b>✅ REASONS ({len(sig['reasons'])}):</b>\n"
+        msg += f"\n<b>🛑 SL:</b> ${sig['stop_loss']:.6f}  (-{sig['risk_percent']:.2f}%)\n"
+        msg += f"<i>💡 After TP1: move SL to entry (breakeven)</i>\n\n"
+
+        msg += f"<b>✅ REASONS:</b>\n"
         for r in sig['reasons']:
             msg += f"  • {r}\n"
 
-        msg += f"\n<b>📡 LIVE TRACKING ACTIVE!</b>\n"
-        msg += f"<i>⏰ {sig['timestamp'].strftime('%H:%M:%S')} | v2.0</i>\n"
-        msg += f"{'='*40}"
+        msg += f"\n<b>📡 LIVE TRACKING ON</b> | v3.0\n"
+        msg += f"<i>⏰ {sig['timestamp'].strftime('%H:%M:%S')}</i>\n"
+        msg += f"{'='*42}"
         return msg
 
-    # ── Telegram helpers ──────────────────────────────────────
+    # ── Telegram ──────────────────────────────────────────────
 
     async def send_msg(self, msg):
         try:
@@ -573,44 +551,46 @@ class AdvancedDayTradingScanner:
             logger.error(f"Send error: {e}")
 
     async def send_tp_alert(self, trade, tp_num, price):
-        emoji = "🎉" if trade['signal'] == 'LONG' else "💰"
-        tp    = trade['targets'][tp_num - 1]
-        pct   = abs((tp - trade['entry']) / trade['entry'] * 100)
+        emoji = '🎉' if trade['signal'] == 'LONG' else '💰'
+        tp  = trade['targets'][tp_num - 1]
+        pct = abs((tp - trade['entry']) / trade['entry'] * 100)
 
-        msg  = f"{emoji} <b>TARGET HIT!</b> {emoji}\n\n"
+        msg  = f"{emoji} <b>TP{tp_num} HIT!</b> {emoji}\n\n"
         msg += f"<code>{trade['trade_id']}</code>\n"
         msg += f"<b>{trade['symbol']}</b> {trade['signal']}\n\n"
-        msg += f"<b>✅ TP{tp_num} HIT!</b>\n"
         msg += f"Target: ${tp:.6f}\n"
-        msg += f"Current: ${price:.6f}\n"
-        msg += f"Profit: +{pct:.2f}%\n\n"
+        msg += f"Profit: <b>+{pct:.2f}%</b>\n\n"
 
         if tp_num == 1:
-            msg += "📋 Take 40% profit\nMove SL to breakeven"
+            msg += "📋 <b>Action:</b> Take 40% profit\n"
+            msg += "🔒 Move SL to <b>breakeven</b> (entry price)\n"
+            msg += "Let rest ride to TP2 ✨"
         elif tp_num == 2:
-            msg += "📋 Take 40% more profit"
+            msg += "📋 <b>Action:</b> Take another 40% profit\n"
+            msg += "Let last 20% ride to TP3 🎯"
         else:
-            msg += "📋 Take remaining 20%\n🎊 TRADE COMPLETE!"
+            msg += "📋 <b>Action:</b> Close remaining 20%\n"
+            msg += "🎊 <b>FULL TRADE COMPLETE!</b>"
 
         await self.send_msg(msg)
         self.stats[f'tp{tp_num}_hits'] += 1
 
     async def send_sl_alert(self, trade, price):
         loss = abs((price - trade['entry']) / trade['entry'] * 100)
-        msg  = f"⚠️ <b>STOP LOSS HIT!</b> ⚠️\n\n"
+        msg  = f"⚠️ <b>STOP LOSS HIT</b> ⚠️\n\n"
         msg += f"<code>{trade['trade_id']}</code>\n"
         msg += f"{trade['symbol']} {trade['signal']}\n\n"
-        msg += f"Entry: ${trade['entry']:.6f}\n"
-        msg += f"SL: ${trade['stop_loss']:.6f}\n"
-        msg += f"Current: ${price:.6f}\n"
-        msg += f"Loss: -{loss:.2f}%"
+        msg += f"Entry:  ${trade['entry']:.6f}\n"
+        msg += f"SL:     ${trade['stop_loss']:.6f}\n"
+        msg += f"Price:  ${price:.6f}\n"
+        msg += f"Loss:   <b>-{loss:.2f}%</b>"
         await self.send_msg(msg)
         self.stats['sl_hits'] += 1
 
     # ── Trade tracker ─────────────────────────────────────────
 
     async def track_trades(self):
-        logger.info("📡 Tracking started")
+        logger.info("📡 Trade tracker started")
         while True:
             try:
                 if not self.active_trades:
@@ -621,7 +601,10 @@ class AdvancedDayTradingScanner:
                 for tid, trade in list(self.active_trades.items()):
                     try:
                         if datetime.now() - trade['timestamp'] > timedelta(hours=MAX_TRADE_HOURS):
-                            await self.send_msg(f"⏰ 24H LIMIT\n<code>{tid}</code>\n{trade['symbol']} — close position!")
+                            await self.send_msg(
+                                f"⏰ <b>24H TIMEOUT</b>\n<code>{tid}</code>\n"
+                                f"{trade['symbol']} — please close manually!"
+                            )
                             to_remove.append(tid)
                             continue
 
@@ -663,28 +646,27 @@ class AdvancedDayTradingScanner:
                 await asyncio.sleep(30)
 
             except Exception as e:
-                logger.error(f"Tracking loop error: {e}")
+                logger.error(f"Tracker loop error: {e}")
                 await asyncio.sleep(60)
 
     # ── Main scanner ──────────────────────────────────────────
 
     async def scan_all(self):
         if self.is_scanning:
-            logger.info("⚠️ Already scanning...")
+            logger.info("⚠️ Scan in progress, skipping...")
             return []
 
         self.is_scanning = True
-        logger.info("🔍 Starting scan...")
+        logger.info("🔍 Scan started")
 
         await self.update_btc_regime()
-
         pairs   = await self.get_all_usdt_pairs()
         signals = []
         scanned = 0
 
         for pair in pairs:
             try:
-                logger.info(f"  📊 {pair}...")
+                logger.info(f"  📊 {pair}")
                 data = await self.fetch_day_trading_data(pair)
                 if data:
                     sig = self.detect_signal(data, pair)
@@ -698,13 +680,15 @@ class AdvancedDayTradingScanner:
                             self.stats['short_signals'] += 1
                         if 'PREMIUM' in sig['quality']:
                             self.stats['premium_signals'] += 1
+                        elif 'HIGH' in sig['quality']:
+                            self.stats['high_signals'] += 1
                         self.active_trades[sig['trade_id']] = sig
                         await self.send_msg(self.format_signal(sig))
                         await asyncio.sleep(1.5)
 
                 scanned += 1
-                if scanned % 25 == 0:
-                    logger.info(f"  📈 {scanned}/{len(pairs)} scanned")
+                if scanned % 30 == 0:
+                    logger.info(f"  📈 Progress: {scanned}/{len(pairs)}")
                 await asyncio.sleep(0.5)
 
             except Exception as e:
@@ -713,41 +697,50 @@ class AdvancedDayTradingScanner:
         self.stats['last_scan_time'] = datetime.now()
         self.stats['pairs_scanned']  = scanned
 
-        regime_str = f"BTC: {self.btc_regime}" if self.btc_regime else ""
-        summary  = f"✅ <b>SCAN COMPLETE</b> v2.0\n\n"
-        summary += f"📊 Scanned: {scanned} | {regime_str}\n"
-        summary += f"🎯 Signals: {len(signals)}\n"
-        if signals:
-            longs   = sum(1 for s in signals if s['signal'] == 'LONG')
-            shorts  = len(signals) - longs
-            premium = sum(1 for s in signals if 'PREMIUM' in s['quality'])
-            high    = sum(1 for s in signals if 'HIGH' in s['quality'])
-            summary += f"  🟢 Long: {longs}\n"
-            summary += f"  🔴 Short: {shorts}\n"
-            summary += f"  💎 Premium: {premium}\n"
-            summary += f"  🔥 High: {high}\n"
-        summary += f"  ⚡ Filtered longs: {self.stats['filtered_long']}\n"
-        summary += f"  📡 Tracking: {len(self.active_trades)}\n"
-        summary += f"\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+        longs   = sum(1 for s in signals if s['signal'] == 'LONG')
+        shorts  = len(signals) - longs
+        premium = sum(1 for s in signals if 'PREMIUM' in s['quality'])
+        high    = sum(1 for s in signals if 'HIGH' in s['quality'])
+        counter = sum(1 for s in signals if s.get('regime_warning'))
+
+        summary  = f"✅ <b>SCAN COMPLETE</b> — v3.0\n\n"
+        summary += f"📊 Scanned: {scanned} pairs\n"
+        summary += f"🌍 BTC Regime: <b>{self.btc_regime or '?'}</b>\n\n"
+        summary += f"🎯 Signals: <b>{len(signals)}</b>\n"
+        summary += f"  🟢 Long:  {longs}\n"
+        summary += f"  🔴 Short: {shorts}\n"
+        summary += f"  💎 Premium: {premium}\n"
+        summary += f"  🔥 High:    {high}\n"
+        if counter:
+            summary += f"  ⚠️ Counter-regime: {counter}\n"
+        summary += f"\n⚡ Filtered weak longs: {self.stats['filtered_long']}\n"
+        summary += f"📡 Active trades: {len(self.active_trades)}\n"
+        summary += f"⏰ {datetime.now().strftime('%H:%M:%S')}"
         await self.send_msg(summary)
 
-        logger.info(f"🎉 Done! {len(signals)} signals from {scanned} pairs")
+        logger.info(f"✅ Scan done: {len(signals)} signals / {scanned} pairs")
         self.is_scanning = False
         return signals
 
     async def run(self, interval=SCAN_INTERVAL_MIN):
-        logger.info("🚀 ADVANCED DAY TRADING SCANNER v2.0")
+        logger.info("🚀 ADVANCED DAY TRADING SCANNER v3.0 STARTING")
 
-        welcome  = "🔥 <b>ADVANCED DAY TRADING SCANNER v2.0</b> 🔥\n\n"
-        welcome += "✅ Tighter TPs (0.8/1.3/1.8x ATR)\n"
-        welcome += "✅ LONG trend confirmation filter\n"
-        welcome += "✅ BTC market regime filter\n"
-        welcome += "✅ Better PREMIUM/HIGH thresholds\n"
-        welcome += "✅ 25+ indicators | Live TP/SL tracking\n\n"
-        welcome += f"Scanning every {interval} min\n\n"
+        welcome  = "🔥 <b>ADVANCED DAY TRADING SCANNER v3.0</b> 🔥\n\n"
+        welcome += "<b>What's new in v3:</b>\n"
+        welcome += "✅ ALL USDT pairs scanned\n"
+        welcome += "✅ Tighter TPs: 0.6/1.0/1.5x ATR\n"
+        welcome += "✅ Smart LONG filter (relaxed)\n"
+        welcome += "✅ BTC regime warning (not block)\n"
+        welcome += "✅ Breakeven SL tip after TP1\n"
+        welcome += "✅ 25+ indicators | 35pt scoring\n\n"
+        welcome += f"⏱ Scanning every <b>{interval} min</b>\n\n"
         welcome += "<b>Commands:</b>\n"
-        welcome += "/scan /stats /trades /whitelist /allpairs /help\n\n"
-        welcome += "🎯 Smarter signals. Higher win rate."
+        welcome += "/scan — Force scan now\n"
+        welcome += "/stats — Live statistics\n"
+        welcome += "/trades — Active trades\n"
+        welcome += "/regime — BTC market regime\n"
+        welcome += "/help — Full help\n\n"
+        welcome += "🎯 <i>Built with backtest data. Let's get it.</i>"
         await self.send_msg(welcome)
 
         asyncio.create_task(self.track_trades())
@@ -755,10 +748,10 @@ class AdvancedDayTradingScanner:
         while True:
             try:
                 await self.scan_all()
-                logger.info(f"💤 Next scan in {interval} min")
+                logger.info(f"💤 Sleeping {interval} min")
                 await asyncio.sleep(interval * 60)
             except Exception as e:
-                logger.error(f"❌ Run error: {e}")
+                logger.error(f"Run error: {e}")
                 await asyncio.sleep(60)
 
     async def close(self):
@@ -766,109 +759,110 @@ class AdvancedDayTradingScanner:
 
 
 # ─────────────────────────────────────────────────────────────
-# BOT COMMANDS
+# COMMANDS
 # ─────────────────────────────────────────────────────────────
 
 class BotCommands:
-    def __init__(self, scanner):
+    def __init__(self, scanner: AdvancedDayTradingScanner):
         self.scanner = scanner
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg  = "🚀 <b>Advanced Day Trading Scanner v2.0</b>\n\n"
-        msg += "Improved with backtest-driven optimizations.\n\n"
-        msg += "<b>Commands:</b>\n"
-        msg += "/scan — Force scan now\n"
-        msg += "/stats — Full statistics\n"
-        msg += "/trades — Active trades\n"
-        msg += "/whitelist — Scan top 14 pairs only\n"
-        msg += "/allpairs — Scan all USDT pairs\n"
-        msg += "/help — Help & indicator info\n\n"
-        msg += "💎 Premium signals = highest conviction!"
+        msg  = "🚀 <b>Advanced Day Trading Scanner v3.0</b>\n\n"
+        msg += "Backtest-optimized. Scans ALL USDT pairs.\n\n"
+        msg += "/scan — Force scan\n/stats — Stats\n/trades — Active\n/regime — BTC regime\n/help — Help"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if self.scanner.is_scanning:
-            await update.message.reply_text("⚠️ Scan already running!")
+            await update.message.reply_text("⚠️ Scan already running! Wait for it to finish.")
             return
-        await update.message.reply_text("🔍 Starting scan now...")
+        await update.message.reply_text("🔍 Starting full scan of ALL USDT pairs...")
         asyncio.create_task(self.scanner.scan_all())
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         s   = self.scanner.stats
         tot = s['total_signals']
-        tp1 = s['tp1_hits']
-        tp2 = s['tp2_hits']
-        tp3 = s['tp3_hits']
-        sl  = s['sl_hits']
+        tp1 = s['tp1_hits']; tp2 = s['tp2_hits']; tp3 = s['tp3_hits']; sl = s['sl_hits']
         completed = tp1 + sl
-        wr = (tp1 / completed * 100) if completed > 0 else 0
+        wr = round(tp1 / completed * 100, 1) if completed > 0 else 0
 
-        msg  = f"📊 <b>STATISTICS v2.0</b>\n\n"
-        msg += f"<b>Signals:</b>\n"
-        msg += f"  Total: {tot}\n"
-        msg += f"  Long:  {s['long_signals']} 🟢\n"
-        msg += f"  Short: {s['short_signals']} 🔴\n"
+        msg  = f"📊 <b>LIVE STATS — v3.0</b>\n\n"
+        msg += f"<b>Signals Generated:</b>\n"
+        msg += f"  Total:   {tot}\n"
+        msg += f"  Long:    {s['long_signals']} 🟢\n"
+        msg += f"  Short:   {s['short_signals']} 🔴\n"
         msg += f"  Premium: {s['premium_signals']} 💎\n"
-        msg += f"  Filtered (LONG): {s['filtered_long']} ⚡\n\n"
-        msg += f"<b>Results:</b>\n"
-        msg += f"  TP1: {tp1} 🎯\n"
-        msg += f"  TP2: {tp2} 🎯\n"
-        msg += f"  TP3: {tp3} 🎯\n"
+        msg += f"  High:    {s['high_signals']} 🔥\n"
+        msg += f"  Filtered longs: {s['filtered_long']} ⚡\n\n"
+        msg += f"<b>Outcomes:</b>\n"
+        msg += f"  TP1: {tp1} 🎯  TP2: {tp2} 🎯  TP3: {tp3} 🎯\n"
         msg += f"  SL:  {sl} ❌\n"
-        msg += f"  Live WR: {wr:.1f}%\n\n"
-        msg += f"<b>BTC Regime:</b> {self.scanner.btc_regime or 'Unknown'}\n"
-        msg += f"<b>Mode:</b> {'Whitelist' if self.scanner.use_whitelist else 'All Pairs'}\n"
+        msg += f"  Live Win Rate: <b>{wr}%</b>\n\n"
+        msg += f"<b>Market:</b>\n"
+        msg += f"  BTC Regime: {self.scanner.btc_regime or 'Unknown'}\n"
+        msg += f"  Tracking:   {len(self.scanner.active_trades)} trades\n"
         if s['last_scan_time']:
             msg += f"\nLast scan: {s['last_scan_time'].strftime('%H:%M:%S')}\n"
-            msg += f"Pairs: {s['pairs_scanned']}"
+            msg += f"Pairs scanned: {s['pairs_scanned']}"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         trades = self.scanner.active_trades
         if not trades:
-            await update.message.reply_text("📭 No active trades")
+            await update.message.reply_text("📭 No active trades right now.")
             return
-
         msg = f"📡 <b>ACTIVE TRADES ({len(trades)})</b>\n\n"
         for tid, t in list(trades.items())[:10]:
-            age = datetime.now() - t['timestamp']
-            hrs = int(age.total_seconds() / 3600)
-            tp_status = "".join(["✅" if hit else "⏳" for hit in t['tp_hit']])
-            msg += f"<b>{t['symbol']}</b> {t['signal']} {t['quality']}\n"
-            msg += f"  {tp_status} | {hrs}h | score {t['score_percent']:.0f}%\n\n"
+            age = int((datetime.now() - t['timestamp']).total_seconds() / 3600)
+            tps = ''.join(['✅' if h else '⏳' for h in t['tp_hit']])
+            warn = t.get('regime_warning', '')
+            msg += f"<b>{t['symbol']}</b> {t['signal']} {t['quality']}{warn}\n"
+            msg += f"  {tps} | {age}h | {t['score_percent']:.0f}%\n"
+            msg += f"  Entry: ${t['entry']:.6f}\n\n"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
-    async def cmd_whitelist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.scanner.use_whitelist = True
-        pairs_str = "\n".join([f"  • {p.replace('/USDT:USDT','')}" for p in WHITELIST_PAIRS])
-        msg  = f"✅ <b>Whitelist mode ON</b>\n\n"
-        msg += f"Scanning {len(WHITELIST_PAIRS)} best performers:\n{pairs_str}\n\n"
-        msg += "Use /allpairs to switch back."
+    async def cmd_regime(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        regime = self.scanner.btc_regime or 'Unknown'
+        emoji  = '🐂' if regime == 'BULL' else '🐻' if regime == 'BEAR' else '❓'
+        msg  = f"{emoji} <b>BTC Market Regime: {regime}</b>\n\n"
+        if regime == 'BULL':
+            msg += "BTC is <b>above</b> 4H EMA21\n"
+            msg += "✅ LONG signals are with the trend\n"
+            msg += "⚠️ SHORT signals flagged as counter-regime"
+        elif regime == 'BEAR':
+            msg += "BTC is <b>below</b> 4H EMA21\n"
+            msg += "✅ SHORT signals are with the trend\n"
+            msg += "⚠️ LONG signals flagged as counter-regime"
+        else:
+            msg += "Regime not yet determined — run /scan first"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-    async def cmd_allpairs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.scanner.use_whitelist = False
-        await update.message.reply_text("✅ Switched to ALL USDT pairs mode.")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        msg  = "📚 <b>ADVANCED DAY TRADING SCANNER v2.0</b>\n\n"
-        msg += "<b>v2 Changes (backtest-driven):</b>\n"
-        msg += "• TP1/2/3: 0.8/1.3/1.8x ATR (tighter, more hits)\n"
-        msg += "• LONG filter: needs trend confirm\n"
-        msg += "• BTC regime: no LONGs in bear market\n"
-        msg += "• PREMIUM threshold: 65% (was 71%)\n\n"
-        msg += "<b>Quality Tiers:</b>\n"
-        msg += "💎 PREMIUM (65%+) — highest conviction\n"
-        msg += "🔥 HIGH (55%+) — strong signal\n"
-        msg += "✅ GOOD (51%+) — valid setup\n\n"
-        msg += "<b>Indicators (35pt system):</b>\n"
-        msg += "• Trend: EMA, SuperTrend, PSAR, Aroon\n"
-        msg += "• Momentum: RSI, MACD, Stoch RSI, UO\n"
-        msg += "• Volume: OBV, MFI, CMF, A/D\n"
-        msg += "• Volatility: BB, Keltner, Donchian\n"
-        msg += "• Patterns: Engulfing, Divergence\n\n"
+        msg  = "📚 <b>SCANNER v3.0 — FULL GUIDE</b>\n\n"
+        msg += "<b>TP Strategy (v3):</b>\n"
+        msg += "  TP1: 0.6x ATR — fast, near-certain\n"
+        msg += "  TP2: 1.0x ATR — realistic target\n"
+        msg += "  TP3: 1.5x ATR — extended run\n"
+        msg += "  SL:  1.5x ATR — tight protection\n\n"
+        msg += "<b>Position Management:</b>\n"
+        msg += "  TP1 hit → Take 40%, move SL to entry\n"
+        msg += "  TP2 hit → Take 40%\n"
+        msg += "  TP3 hit → Take final 20%\n\n"
+        msg += "<b>Signal Quality:</b>\n"
+        msg += "  💎 PREMIUM (65%+) — max conviction\n"
+        msg += "  🔥 HIGH (55%+) — strong setup\n"
+        msg += "  ✅ GOOD (51%+) — valid signal\n\n"
+        msg += "<b>Regime Warning ⚠️:</b>\n"
+        msg += "  Signal goes against BTC trend\n"
+        msg += "  Still valid — just trade smaller size\n\n"
+        msg += "<b>Indicators used (35pt system):</b>\n"
+        msg += "  Trend: EMA9/21/50, SuperTrend, PSAR, Aroon\n"
+        msg += "  Momentum: RSI, MACD, StochRSI, UO, Williams\n"
+        msg += "  Volume: OBV, MFI, CMF, A/D Line\n"
+        msg += "  Volatility: BB, Keltner, Donchian, ATR\n"
+        msg += "  Patterns: Engulfing, Divergence, VWAP\n\n"
         msg += "<b>Commands:</b>\n"
-        msg += "/scan /stats /trades /whitelist /allpairs /help"
+        msg += "/scan /stats /trades /regime /help"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
@@ -878,11 +872,11 @@ class BotCommands:
 
 async def main():
     # ════════════════════════════════════
-    #   CONFIG — fill in your credentials
+    #   YOUR CREDENTIALS
     # ════════════════════════════════════
     TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
     TELEGRAM_CHAT_ID = "-1002442074724"
-    BINANCE_API_KEY  = None   # Optional — public data works without keys
+    BINANCE_API_KEY  = None   # Not needed for public data
     BINANCE_SECRET   = None
 
     scanner = AdvancedDayTradingScanner(
@@ -895,22 +889,21 @@ async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     cmds = BotCommands(scanner)
 
-    app.add_handler(CommandHandler("start",     cmds.cmd_start))
-    app.add_handler(CommandHandler("scan",      cmds.cmd_scan))
-    app.add_handler(CommandHandler("stats",     cmds.cmd_stats))
-    app.add_handler(CommandHandler("trades",    cmds.cmd_trades))
-    app.add_handler(CommandHandler("whitelist", cmds.cmd_whitelist))
-    app.add_handler(CommandHandler("allpairs",  cmds.cmd_allpairs))
-    app.add_handler(CommandHandler("help",      cmds.cmd_help))
+    app.add_handler(CommandHandler("start",  cmds.cmd_start))
+    app.add_handler(CommandHandler("scan",   cmds.cmd_scan))
+    app.add_handler(CommandHandler("stats",  cmds.cmd_stats))
+    app.add_handler(CommandHandler("trades", cmds.cmd_trades))
+    app.add_handler(CommandHandler("regime", cmds.cmd_regime))
+    app.add_handler(CommandHandler("help",   cmds.cmd_help))
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 Bot v2.0 ready!")
+    logger.info("🤖 Bot v3.0 ready!")
 
     try:
         await scanner.run(interval=SCAN_INTERVAL_MIN)
     except KeyboardInterrupt:
-        logger.info("⚠️ Shutting down...")
+        logger.info("Shutting down...")
     finally:
         await scanner.close()
         await app.stop()
