@@ -55,7 +55,7 @@ ATR_TP1_MULT = 0.6   # Confirmed ~78% hit rate
 ATR_TP2_MULT = 0.8   # Was 1.0 — still never hit, tightened again
 ATR_TP3_MULT = 1.2   # Was 1.5 — more realistic
 
-MIN_SCORE_PCT       = 0.53   # Raised from 0.51 — cuts noisy signals
+MIN_SCORE_PCT       = 0.50   # Raised from 0.51 — cuts noisy signals
 QUALITY_PREMIUM_PCT = 0.65   # 65%+ = PREMIUM
 
 HARD_BLOCK_REGIME     = True   # KEY FIX: 53.7% → 96.4% WR
