@@ -808,8 +808,8 @@ class BotCommands:
 
 async def main():
     # ════════════════════════════════════
-    TELEGRAM_TOKEN   = "YOUR_BOT_TOKEN"
-    TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+    TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
+    TELEGRAM_CHAT_ID = "-1003425977005"
     BINANCE_API_KEY  = None    # not needed for scanning
     BINANCE_SECRET   = None
     # ════════════════════════════════════
