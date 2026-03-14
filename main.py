@@ -1,21 +1,20 @@
 """
 ADVANCED DAY TRADING SCANNER v6.0 — FINAL PRODUCTION
 ======================================================
-Settings locked from 5 rounds of backtesting (v1→v6):
+Settings locked from 6 rounds of backtesting (v1→v6, 600 pairs):
 
-  MIN_SCORE_PCT = 0.45   ← key change from 0.53, unlocks signal volume
-  REGIME_MODE   = 'HARD' ← blocks counter-BTC trades, keeps WR at 88.9%
-  TRADE_MODE    = 'TP1_ONLY' ← close 100% at TP1, proven reliable
+  MIN_SCORE_PCT = 0.43   ← 600-pair backtest optimal
+  REGIME_MODE   = 'HARD' ← blocks counter-BTC trades
+  TRADE_MODE    = 'TP1_ONLY' ← close 100% at TP1
   ATR_TP1_ONLY  = 0.6x ATR
   ATR_SL_MULT   = 1.5x ATR
-  LONG_FILTER   = True
 
-Backtest results (90 days, 150 pairs):
-  ✅ 3.0 signals/day (90/month)
-  ✅ 88.9% win rate
-  ✅ +1.21% avg per trade
-  ✅ Long WR: 86.0% | Short WR: 90.6%
-  ✅ Max drawdown: -6.81%
+Backtest results (90 days, 600 pairs):
+  ✅ 3.7 signals/day (111/month)
+  ✅ 85.2% win rate
+  ✅ +1.19% avg per trade
+  ✅ Long WR: 83.5% | Short WR: 85.7%
+  ✅ Max drawdown: -10.81%
 
 Install:
   pip install ccxt ta pandas numpy python-telegram-bot
@@ -53,8 +52,8 @@ USE_LONG_TREND_FILTER = True         # require at least 1 of 5 trend confirms fo
 ATR_TP1_ONLY = 0.6                   # 88.9% hit rate in backtest
 ATR_SL_MULT  = 1.5
 
-MIN_SCORE_PCT       = 0.45           # ← main unlock for 3/day signal volume
-QUALITY_PREMIUM_PCT = 0.65           # 65%+ score = PREMIUM tier
+MIN_SCORE_PCT       = 0.43           # 600-pair backtest: 3.7/day at 85.2% WR
+QUALITY_PREMIUM_PCT = 0.60           # 60%+ score = PREMIUM (adjusted for lower score range)
 
 SCAN_INTERVAL_MIN = 15
 MIN_VOLUME_USDT   = 500_000          # wider universe
@@ -77,6 +76,7 @@ class AdvancedDayTradingScanner:
         })
         self.signal_history = deque(maxlen=300)
         self.active_trades  = {}
+        self.pair_cooldown  = {}   # key: "SYMBOL_DIRECTION" → datetime of last signal
         self.btc_regime     = None
         self.btc_price      = None
         self.btc_ema        = None
@@ -503,6 +503,8 @@ class AdvancedDayTradingScanner:
         m += f"📋 <b>Close 100% — trade done ✅</b>\n"
         m += f"<i>{trade['trade_id']}</i>"
         await self.send_msg(m)
+        trade['outcome'] = 'TP1'
+        trade['pnl_pct'] = gain
         self.stats['tp1_hits'] += 1
 
     async def _sl_alert(self, trade, price):
@@ -514,6 +516,8 @@ class AdvancedDayTradingScanner:
         m += f"Loss:  <b>-{loss:.2f}%</b>\n\n"
         m += f"<i>Next signal incoming 🎯</i>"
         await self.send_msg(m)
+        trade['outcome'] = 'SL'
+        trade['pnl_pct'] = -loss
         self.stats['sl_hits'] += 1
 
     # ── Trade Tracker ─────────────────────────────────────────
@@ -590,6 +594,15 @@ class AdvancedDayTradingScanner:
                 if data:
                     sig = self.detect_signal(data, pair)
                     if sig:
+                        # Per-pair cooldown — don't re-fire same direction within 4h
+                        ck = f"{sig['symbol']}_{sig['signal']}"
+                        last = self.pair_cooldown.get(ck)
+                        if last and (datetime.now() - last).total_seconds() < 4 * 3600:
+                            logger.info(f"⏳ Cooldown skip: {sig['symbol']} {sig['signal']}")
+                            await asyncio.sleep(0.4)
+                            continue
+
+                        self.pair_cooldown[ck] = datetime.now()
                         signals.append(sig)
                         self.active_trades[sig['trade_id']] = sig
                         self.signal_history.append(sig)
@@ -613,9 +626,74 @@ class AdvancedDayTradingScanner:
         self.is_scanning = False
         return signals
 
+    async def send_daily_report(self):
+        """Send a 24h performance report to Telegram every day at the same time the bot started."""
+        while True:
+            await asyncio.sleep(24 * 3600)
+            try:
+                s    = self.stats
+                tp   = s['tp1_hits']
+                sl   = s['sl_hits']
+                tot  = tp + sl
+                wr   = round(tp / tot * 100, 1) if tot > 0 else 0
+                hrs  = round((datetime.now() - s['session_start']).total_seconds() / 3600, 1)
+
+                # Last 24h trades from signal_history
+                cutoff   = datetime.now() - timedelta(hours=24)
+                day_sigs = [t for t in self.signal_history if t['timestamp'] >= cutoff]
+                day_long  = sum(1 for t in day_sigs if t['signal'] == 'LONG')
+                day_short = sum(1 for t in day_sigs if t['signal'] == 'SHORT')
+                day_prem  = sum(1 for t in day_sigs if 'PREMIUM' in t['quality'])
+
+                re = '🐂' if self.btc_regime == 'BULL' else '🐻'
+
+                m  = f"{'─'*38}\n"
+                m += f"📅 <b>24H DAILY REPORT</b>\n"
+                m += f"{'─'*38}\n\n"
+                m += f"{re} BTC: <b>{self.btc_regime}</b>  |  Session: {hrs}h\n\n"
+
+                m += f"<b>── Today's Signals ──</b>\n"
+                m += f"  Total:   <b>{len(day_sigs)}</b>  ({day_long}L / {day_short}S)\n"
+                m += f"  Premium: 💎 {day_prem}\n\n"
+
+                # Calculate total pnl from resolved trades in signal history
+                tp_trades = [t for t in self.signal_history if t.get('outcome') == 'TP1']
+                sl_trades = [t for t in self.signal_history if t.get('outcome') == 'SL']
+                tp_pnl    = sum(t.get('pnl_pct', 0) for t in tp_trades)
+                sl_pnl    = sum(t.get('pnl_pct', 0) for t in sl_trades)
+
+                m += f"<b>── All-time Outcomes ──</b>\n"
+                m += f"  ✅ TP Hit:  <b>{tp}</b>  (<code>+{tp_pnl:.2f}%</code>)\n"
+                m += f"  ❌ SL Hit:  <b>{sl}</b>  (<code>{sl_pnl:.2f}%</code>)\n"
+                m += f"  📊 Total:   <b>{tot}</b>\n\n"
+
+                # Win rate bar
+                bar_filled = int(wr / 10)
+                bar = '▰' * bar_filled + '▱' * (10 - bar_filled)
+                m += f"<b>Win Rate: {wr}%</b>\n"
+                m += f"{bar}\n\n"
+
+                # WR status emoji
+                if wr >= 85:   status = "🔥 Excellent — bot is performing well"
+                elif wr >= 78: status = "✅ Good — within expected range"
+                elif wr >= 70: status = "⚠️ Watch closely — slightly below target"
+                else:          status = "🚨 Below target — consider raising MIN_SCORE to 0.45"
+
+                m += f"{status}\n\n"
+                m += f"  Regime blocked: {s['regime_blocked']}\n"
+                m += f"  Tracking now:   {len(self.active_trades)} trades\n"
+                m += f"<i>⏰ {datetime.now().strftime('%d %b %Y %H:%M UTC')}</i>"
+
+                await self.send_msg(m)
+                logger.info(f"📅 Daily report sent | WR:{wr}% | TP:{tp} SL:{sl}")
+
+            except Exception as e:
+                logger.error(f"Daily report error: {e}")
+
     async def run(self):
-        logger.info("🚀 v6.0 started | TP1-ONLY | HARD regime | MIN_SCORE=45%")
+        logger.info("🚀 v6.0 started | TP1-ONLY | HARD regime | MIN_SCORE=43%")
         asyncio.create_task(self.track_trades())
+        asyncio.create_task(self.send_daily_report())
 
         while True:
             try:
@@ -730,8 +808,8 @@ class BotCommands:
 
 async def main():
     # ════════════════════════════════════
-    TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
-    TELEGRAM_CHAT_ID = "-1002442074724"
+    TELEGRAM_TOKEN   = "YOUR_BOT_TOKEN"
+    TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
     BINANCE_API_KEY  = None    # not needed for scanning
     BINANCE_SECRET   = None
     # ════════════════════════════════════
