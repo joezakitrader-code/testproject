@@ -103,8 +103,8 @@ SHORT_TP2_PCT = 0.30
 TIMEFRAME         = '1h'
 CANDLE_LIMIT      = 300
 SCAN_INTERVAL_MIN = 60          # 60 min = scan on every closed 1h candle
-MAX_PAIRS         = 200
-MIN_VOLUME_USDT   = 1_000_000
+MAX_PAIRS         = 600
+MIN_VOLUME_USDT   = 500_000
 COOLDOWN_HOURS    = 6
 MAX_TRADE_HOURS   = 24
 
