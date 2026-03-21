@@ -38,17 +38,24 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 import ta
 import logging
+import sys
+import io
 from collections import deque
 import warnings
 
 warnings.filterwarnings('ignore')
 
+# ── Windows UTF-8 fix — forces terminal to accept emojis ──
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('ict_ob_live_v10.log'),
+        logging.StreamHandler(stream=sys.stdout),
+        logging.FileHandler('ict_ob_live_v10.log', encoding='utf-8'),
     ]
 )
 logger = logging.getLogger(__name__)
