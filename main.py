@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 # CREDENTIALS
 # ═══════════════════════════════════════════════════════════════
 
-TELEGRAM_TOKEN   = os.environ['7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic']
-TELEGRAM_CHAT_ID = os.environ['-1003659830260']
+TELEGRAM_TOKEN   = os.environ['TELEGRAM_TOKEN']
+TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 BINANCE_API_KEY  = os.environ.get('BINANCE_API_KEY', None)
 BINANCE_SECRET   = os.environ.get('BINANCE_SECRET',  None)
 
