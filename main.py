@@ -1,1127 +1,697 @@
 """
-SUPPLY & DEMAND SCANNER BOT v1.0
-==================================
-Drop-in replacement for AdvancedDayTradingScanner.
-Implements the full v7 backtest strategy (82.7% WR, PF 21.5, DD -1.8%).
+BRETT 3-STEP LIVE SCANNER v1.0
+================================
+Direction → Location → Execution
 
-Strategy: Supply & Demand zones (DBR / RBD patterns) with 7-fix filter stack.
-  - Zone detection: consolidation base < 2x ATR, imbalance move > 1.5x ATR
-  - Entry: pin bar or bull/bear engulf ONLY (strong_close banned everywhere)
-  - 4H trend bias filter
-  - SL below/above zone + 0.25x ATR buffer
-  - 50% close at TP1 (1R), runner to TP2 (1.8R), SL → BE after TP1
+BACKTEST RESULTS (180d, 300 pairs):
+  22 signals | 72.7% TP | +1.91R avg EV | Max DD -3R
+  LONGs: 75% TP | +2R EV
+  Breakeven WR = 25% (we're at 72.7%)
+  At 1% risk = avg +1.91%/trade | ~4 signals/month
 
-Install:
-  pip install ccxt ta pandas numpy python-telegram-bot
+TIMEFRAMES:
+  4H  → Direction (BOS + swing range + bias)
+  1H  → Location  (50% eq + unmitigated POI)
+  15M → Execution (rejection + BOS close + failed cont)
+
+FIXED TP = 3R | SL = rejection candle extreme
+
+Credentials: edit TELEGRAM_TOKEN and TELEGRAM_CHAT_ID below
 """
 
 import asyncio
+import os
+import sys
+import logging
 import ccxt.async_support as ccxt
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
+from datetime import datetime, timedelta, timezone
 from collections import deque
-import logging
+import warnings
+
+warnings.filterwarnings('ignore')
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
-import warnings
-warnings.filterwarnings('ignore')
+# ═══════════════════════════════════════════════════════════════
+# CREDENTIALS — edit here
+# ═══════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════
-# ★  SETTINGS  (tuned from v7 backtest — 82.7% WR)
-# ═══════════════════════════════════════════════════════
+TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
+TELEGRAM_CHAT_ID = "-1003659830260"
+BINANCE_API_KEY  = None
+BINANCE_SECRET   = None
 
-# Zone detection
-CONSOL_ATR_MULT     = 2.0    # base range < 2.0x ATR (consolidation)
-IMBAL_ATR_MULT      = 1.5    # imbalance move > 1.5x ATR (FIX 3)
-MIN_CONFLUENCE      = 1      # vol spike or oversized move required
-ZONE_LOOKBACK       = 80     # bars back to scan for zones (1H)
-ZONE_MAX_AGE        = 100    # zone expires after N 1H candles
+# ═══════════════════════════════════════════════════════════════
+# BRETT SETTINGS
+# ═══════════════════════════════════════════════════════════════
 
-# Entry filters (all 7 fixes embedded)
-MIN_WICK_ATR        = 0.4    # pin bar lower wick ≥ 0.4x ATR
-MIN_BODY_ATR        = 0.2    # FIX 4: body ≥ 0.2x ATR (no doji)
-SC_MAX_ATR_RATIO    = 1.15   # FIX 6A: sc blocked when ATR > 1.15x rolling
-SC_ATR_LOOKBACK     = 20     # rolling window for 6A
-STALL_ATR_MULT      = 1.5    # FIX 6B: engulf stall — 2-bar range < 1.5x ATR
-MIN_BODY_ZONE_RATIO = 0.15   # FIX 6C: body > 15% of zone height
+# Step 1 — Direction (4H)
+SWING_PERIOD_4H  = 8
+BOS_LOOKBACK     = 30
 
-# Trade management
-ATR_SL_BUFFER       = 0.25   # SL = zone edge + 0.25x ATR
-TP1_R               = 1.0    # TP1 at 1R
-TP2_R               = 1.8    # TP2 at 1.8R
-TP1_CLOSE_PCT       = 0.50   # close 50% at TP1, 50% runner to TP2
-MAX_TRADE_HOURS     = 72     # timeout
+# Step 2 — Location (1H)
+DISCOUNT_MAX     = 0.48
+PREMIUM_MIN      = 0.52
+POI_MAX_AGE_1H   = 72
+POI_REACH_BARS   = 5
+
+# Step 3 — Execution (15M)
+REQUIRE_REJECTION   = True
+REQUIRE_BOS_CLOSE   = True
+REQUIRE_FAILED_CONT = True
+
+# Trade
+RR               = 3.0
+SL_BUFFER        = 0.001
 
 # Scanner
-ATR_PERIOD          = 14
-TREND_LOOKBACK_1H   = 50
-SCAN_INTERVAL_MIN   = 15
-MIN_VOLUME_USDT     = 500_000
-TOP_PAIRS_LIMIT     = 50     # scan top N pairs by volume
-
-# ═══════════════════════════════════════════════════════
+MAX_PAIRS        = 300
+MIN_VOLUME_USDT  = 2_000_000
+SCAN_INTERVAL_MIN= 15          # scan every 15 min (15M candle close)
+COOLDOWN_HOURS   = 6
+MAX_TRADE_BARS   = 480         # 120 hours on 15M = 5 days max hold
 
 
-# ── ATR ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# SCANNER
+# ═══════════════════════════════════════════════════════════════
 
-def _calc_atr(H: np.ndarray, L: np.ndarray, C: np.ndarray, period: int = 14) -> np.ndarray:
-    n = len(C)
-    tr = np.zeros(n)
-    tr[0] = H[0] - L[0]
-    for i in range(1, n):
-        tr[i] = max(H[i] - L[i], abs(H[i] - C[i-1]), abs(L[i] - C[i-1]))
-    atr = np.zeros(n)
-    if n >= period:
-        atr[period - 1] = np.mean(tr[:period])
-        for i in range(period, n):
-            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
-        for i in range(period - 1):
-            atr[i] = atr[period - 1]
-    return atr
+class BrettScanner:
 
-
-def _rolling_atr_mean(atr: np.ndarray, i: int, lookback: int = 20) -> float:
-    s = max(0, i - lookback)
-    vals = atr[s:i]
-    return float(np.mean(vals)) if len(vals) > 0 else float(atr[i])
-
-
-# ── 4H TREND ────────────────────────────────────────────────
-
-def _calc_4h_trend(df1h: pd.DataFrame) -> np.ndarray:
-    """Resample 1H df to 4H, compute EMA21/50 crossover, map back to 1H."""
-    n = len(df1h)
-    step = 4
-    H1 = df1h['high'].values
-    L1 = df1h['low'].values
-    C1 = df1h['close'].values
-
-    H4 = np.array([np.max(H1[i:i+step]) for i in range(0, n, step)])
-    L4 = np.array([np.min(L1[i:i+step]) for i in range(0, n, step)])
-    C4 = np.array([C1[min(i+step-1, n-1)] for i in range(0, n, step)])
-
-    def _ema(arr, w):
-        out = np.zeros(len(arr))
-        out[0] = arr[0]
-        k = 2.0 / (w + 1)
-        for i in range(1, len(arr)):
-            out[i] = arr[i] * k + out[i-1] * (1 - k)
-        return out
-
-    e21 = _ema(C4, 21)
-    e50 = _ema(C4, 50)
-
-    T4H = np.empty(n, dtype=object)
-    for b in range(len(C4)):
-        s = b * step
-        e = min(s + step, n)
-        if C4[b] > e21[b] and e21[b] > e50[b]:
-            T4H[s:e] = 'bull'
-        elif C4[b] < e21[b] and e21[b] < e50[b]:
-            T4H[s:e] = 'bear'
-        else:
-            T4H[s:e] = 'neutral'
-    return T4H
-
-
-# ── 1H TREND ────────────────────────────────────────────────
-
-def _detect_trend_1h(H: np.ndarray, L: np.ndarray, C: np.ndarray,
-                     end_idx: int, lookback: int = 50) -> str:
-    """HH/HL = uptrend, LH/LL = downtrend, else range."""
-    s = max(0, end_idx - lookback)
-    h = H[s:end_idx]
-    l = L[s:end_idx]
-    n = len(h)
-    if n < 12:
-        return 'range'
-    sw = 3
-    sh = [i for i in range(sw, n - sw) if h[i] == max(h[max(0, i-sw):i+sw+1])]
-    sl = [i for i in range(sw, n - sw) if l[i] == min(l[max(0, i-sw):i+sw+1])]
-    if len(sh) >= 2 and len(sl) >= 2:
-        if h[sh[-1]] > h[sh[-2]] and l[sl[-1]] > l[sl[-2]]:
-            return 'uptrend'
-        if h[sh[-1]] < h[sh[-2]] and l[sl[-1]] < l[sl[-2]]:
-            return 'downtrend'
-    return 'range'
-
-
-def _confirmed_higher_low(H: np.ndarray, L: np.ndarray, end_idx: int) -> bool:
-    s = max(0, end_idx - 40)
-    l = L[s:end_idx]
-    n = len(l)
-    sw = 3
-    sl = [i for i in range(sw, n - sw) if l[i] == min(l[max(0, i-sw):i+sw+1])]
-    return len(sl) >= 2 and l[sl[-1]] > l[sl[-2]]
-
-
-def _confirmed_lower_high(H: np.ndarray, L: np.ndarray, end_idx: int) -> bool:
-    s = max(0, end_idx - 40)
-    h = H[s:end_idx]
-    n = len(h)
-    sw = 3
-    sh = [i for i in range(sw, n - sw) if h[i] == max(h[max(0, i-sw):i+sw+1])]
-    return len(sh) >= 2 and h[sh[-1]] < h[sh[-2]]
-
-
-# ── ZONE STRUCTURES ──────────────────────────────────────────
-
-@dataclass
-class SDZone:
-    kind:       str      # 'demand' | 'supply'
-    top:        float
-    bottom:     float
-    formed_at:  int      # index in the bar array when zone was created
-    confluence: int = 0
-    is_flip:    bool = False
-    move_atr:   float = 0.0
-
-    @property
-    def mid(self):    return (self.top + self.bottom) / 2
-    @property
-    def height(self): return max(self.top - self.bottom, 1e-9)
-
-
-def _find_zones(H: np.ndarray, L: np.ndarray, C: np.ndarray,
-                V: np.ndarray, ATR: np.ndarray,
-                scan_start: int, scan_end: int) -> List[SDZone]:
-    """Detect DBR (demand) and RBD (supply) zones in bar range [scan_start, scan_end)."""
-    zones: List[SDZone] = []
-    avg_vol = float(np.mean(V[max(0, scan_end - 50):scan_end])) + 1e-9
-
-    for i in range(scan_start + 10, scan_end - 6):
-        atr = ATR[i]
-        if atr < 1e-9:
-            continue
-
-        # 3-candle consolidation base ending at bar i
-        b_s = i - 3
-        b_e = i
-        bh = float(np.max(H[b_s:b_e]))
-        bl = float(np.min(L[b_s:b_e]))
-
-        # Base must be tight
-        if bh - bl >= CONSOL_ATR_MULT * atr:
-            continue
-
-        pre = b_s - 1
-        if pre < scan_start:
-            continue
-        post_end = min(b_e + 5, scan_end - 1)
-
-        # ── DEMAND: drop into base, rally out ──────────────
-        drop_in   = float(C[pre]) - bl
-        rally_out = float(C[post_end]) - bh
-        if drop_in >= IMBAL_ATR_MULT * atr and rally_out >= IMBAL_ATR_MULT * atr:
-            conf = 0
-            if V[b_e] > avg_vol * 1.4:                    conf += 1
-            if rally_out > IMBAL_ATR_MULT * 2 * atr:      conf += 1
-            if drop_in   > IMBAL_ATR_MULT * 2 * atr:      conf += 1
-            zones.append(SDZone(
-                kind='demand', top=bh, bottom=bl,
-                formed_at=i, confluence=conf,
-                move_atr=round(rally_out / atr, 1)
-            ))
-
-        # ── SUPPLY: rally into base, drop out ──────────────
-        rally_in = bh - float(C[pre])
-        drop_out = bl - float(C[post_end])
-        if rally_in >= IMBAL_ATR_MULT * atr and drop_out >= IMBAL_ATR_MULT * atr:
-            conf = 0
-            if V[b_e] > avg_vol * 1.4:                    conf += 1
-            if drop_out  > IMBAL_ATR_MULT * 2 * atr:      conf += 1
-            if rally_in  > IMBAL_ATR_MULT * 2 * atr:      conf += 1
-            zones.append(SDZone(
-                kind='supply', top=bh, bottom=bl,
-                formed_at=i, confluence=conf,
-                move_atr=round(drop_out / atr, 1)
-            ))
-
-    return zones
-
-
-def _enrich_zones(H: np.ndarray, L: np.ndarray, C: np.ndarray,
-                  ATR: np.ndarray, zones: List[SDZone]) -> List[SDZone]:
-    """Add flip flag and filter stale zones."""
-    n = len(C)
-    for z in zones:
-        # Flip: zone overlaps opposite-kind zone in same price area
-        for other in zones:
-            if other is z or other.kind == z.kind:
-                continue
-            overlap = min(z.top, other.top) - max(z.bottom, other.bottom)
-            if overlap > 0 and overlap / z.height > 0.3:
-                z.is_flip = True
-                break
-    return zones
-
-
-# ── REJECTION CANDLE ─────────────────────────────────────────
-
-def _is_rejection_candle(
-    O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray,
-    i: int, atr: float, zone_kind: str
-) -> Tuple[bool, str]:
-    """
-    Checks for pin bar, bull/bear engulf, or strong close.
-    Returns (is_valid, type_name).
-    """
-    if i < 1:
-        return False, 'none'
-    o = O[i]; h = H[i]; l = L[i]; c = C[i]
-    op = O[i-1]; cp = C[i-1]
-    body = abs(c - o)
-    rng  = h - l
-
-    # FIX 4: minimum real body
-    if body < MIN_BODY_ATR * atr:
-        return False, 'none'
-
-    if zone_kind == 'demand':
-        lower_wick = min(o, c) - l
-        if lower_wick >= MIN_WICK_ATR * atr and lower_wick >= 1.5 * max(body, 1e-9):
-            return True, 'pin_bar'
-        if c > o and cp < op and c >= op and o <= cp:
-            return True, 'bull_engulf'
-        if c > o and (c - l) / max(rng, 1e-9) > 0.65 and body >= 0.3 * atr:
-            return True, 'strong_close'
-    else:
-        upper_wick = h - max(o, c)
-        if upper_wick >= MIN_WICK_ATR * atr and upper_wick >= 1.5 * max(body, 1e-9):
-            return True, 'pin_bar'
-        if c < o and cp > op and c <= op and o >= cp:
-            return True, 'bear_engulf'
-        if c < o and (h - c) / max(rng, 1e-9) > 0.65 and body >= 0.3 * atr:
-            return True, 'strong_close'
-
-    return False, 'none'
-
-
-def _strong_close_context_ok(
-    O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray,
-    V: np.ndarray, i: int, atr: float, trend_1h: str
-) -> bool:
-    """FIX 2: strong_close outside range needs vol spike + momentum."""
-    if trend_1h == 'range':
-        return True
-    avg_vol = float(np.mean(V[max(0, i - 20):i])) + 1e-9
-    vol_ok = V[i] > avg_vol * 1.2
-    if i >= 3:
-        ph = max(H[i-3:i])
-        pl = min(L[i-3:i])
-        pr = ph - pl
-        mom_ok = (C[i] - pl) / max(pr, 1e-9) > 0.6 if pr > 0 else False
-    else:
-        mom_ok = False
-    return vol_ok and mom_ok
-
-
-def _has_stall(H: np.ndarray, L: np.ndarray, C: np.ndarray,
-               i: int, atr: float, zone: SDZone) -> bool:
-    """FIX 6B: prior 2-bar range tight, OR prior close inside zone."""
-    if i < 2:
-        return False
-    combined_h = max(H[i-2], H[i-1])
-    combined_l = min(L[i-2], L[i-1])
-    cond_a = (combined_h - combined_l) < STALL_ATR_MULT * atr
-    prior_close = C[i-1]
-    buf = atr * 0.1
-    cond_b = (zone.bottom - buf) <= prior_close <= (zone.top + buf)
-    return cond_a or cond_b
-
-
-# ── ENTRY FILTER STACK (all 7 fixes) ────────────────────────
-
-def _passes_all_filters(
-    O: np.ndarray, H: np.ndarray, L: np.ndarray, C: np.ndarray,
-    V: np.ndarray, ATR: np.ndarray,
-    i: int, atr: float, rej_type: str,
-    trend_1h: str, zone: SDZone
-) -> Tuple[bool, str]:
-    """
-    Returns (allowed, blocked_by_fix).
-    Applies all 7 fixes in order.
-    """
-    # FIX 1: trending market = pin/engulf only
-    if trend_1h in ('uptrend', 'downtrend') and rej_type == 'strong_close':
-        return False, 'fix1'
-
-    # FIX 2: strong_close needs context outside range
-    if rej_type == 'strong_close':
-        if not _strong_close_context_ok(O, H, L, C, V, i, atr, trend_1h):
-            return False, 'fix2'
-
-    # FIX 6A: strong_close blocked in elevated vol regime
-    if rej_type == 'strong_close':
-        rolling = _rolling_atr_mean(ATR, i, SC_ATR_LOOKBACK)
-        if rolling > 0 and ATR[i] / rolling > SC_MAX_ATR_RATIO:
-            return False, 'fix6a'
-
-    # FIX 7: strong_close banned in range (final gate — closes all remaining gaps)
-    if rej_type == 'strong_close' and trend_1h == 'range':
-        return False, 'fix7'
-
-    # FIX 6B: engulf in range needs stall confirm
-    if rej_type in ('bull_engulf', 'bear_engulf') and trend_1h == 'range':
-        if not _has_stall(H, L, C, i, atr, zone):
-            return False, 'fix6b'
-
-    # FIX 6C: candle body > 15% of zone height
-    body = abs(C[i] - O[i])
-    if body < MIN_BODY_ZONE_RATIO * zone.height:
-        return False, 'fix6c'
-
-    return True, ''
-
-
-# ══════════════════════════════════════════════════════════════
-# MAIN SCANNER CLASS
-# ══════════════════════════════════════════════════════════════
-
-class SDScanner:
-    def __init__(self, telegram_token: str, telegram_chat_id: str,
-                 binance_api_key: str = None, binance_secret: str = None):
-
-        self.telegram_token = telegram_token
-        self.telegram_bot   = Bot(token=telegram_token)
-        self.chat_id        = telegram_chat_id
-
+    def __init__(self):
         self.exchange = ccxt.binance({
-            'apiKey':          binance_api_key,
-            'secret':          binance_secret,
+            'apiKey':          BINANCE_API_KEY,
+            'secret':          BINANCE_SECRET,
             'enableRateLimit': True,
             'options':         {'defaultType': 'future'},
         })
-
-        self.active_trades: Dict[str, dict] = {}
-        self.pair_cooldown: Dict[str, datetime] = {}
-        self.signal_history: deque = deque(maxlen=300)
-        self._zone_cache: Dict[str, Tuple[List[SDZone], datetime]] = {}
-
-        self.is_scanning = False
-
+        self.bot            = Bot(token=TELEGRAM_TOKEN)
+        self.chat_id        = TELEGRAM_CHAT_ID
+        self.signal_history = deque(maxlen=200)
+        self.active_trades  = {}
+        self.cooldown       = {}
+        self.fired          = set()
+        self.is_scanning    = False
         self.stats = {
-            'total_signals':   0,
-            'long_signals':    0,
-            'short_signals':   0,
-            'tp1_hits':        0,
-            'tp2_hits':        0,
-            'sl_hits':         0,
-            'be_saves':        0,
-            'timeouts':        0,
-            'filtered':        {'fix1':0,'fix2':0,'fix5':0,'fix6a':0,
-                                'fix6b':0,'fix6c':0,'fix7':0,'no_rej':0,
-                                'trend':0,'cooldown':0},
-            'session_start':   datetime.now(),
-            'last_scan':       None,
-            'pairs_scanned':   0,
+            'total':       0,
+            'long':        0,
+            'short':       0,
+            'tp_hits':     0,
+            'sl_hits':     0,
+            'timeouts':    0,
+            'be_saves':    0,
+            'start':       datetime.now(),
+            'last_scan':   None,
         }
 
-    # ── Data fetching ──────────────────────────────────────────
+    # ── Fetch ─────────────────────────────────────────────────
 
-    async def _fetch_ohlcv(self, symbol: str, tf: str,
-                           limit: int = 120) -> Optional[pd.DataFrame]:
+    async def fetch_tf(self, symbol, tf, limit):
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
-            df = pd.DataFrame(ohlcv,
-                              columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
             return df
-        except Exception as e:
-            logger.error(f"fetch_ohlcv {symbol} {tf}: {e}")
-            return None
+        except:
+            return pd.DataFrame()
 
-    # ── Zone cache (refresh every 8 bars = ~2h on 1H) ─────────
+    # ── STEP 1: Direction (4H) ─────────────────────────────────
 
-    def _get_cached_zones(
-        self, symbol: str,
-        H: np.ndarray, L: np.ndarray, C: np.ndarray,
-        V: np.ndarray, ATR: np.ndarray,
-        current_bar: int
-    ) -> List[SDZone]:
-        cache_key = f"{symbol}_{current_bar // 8}"
-        if cache_key in self._zone_cache:
-            return self._zone_cache[cache_key][0]
+    def get_direction(self, df_4h):
+        if len(df_4h) < SWING_PERIOD_4H * 2 + 5: return None
+        h = df_4h['high'].values
+        l = df_4h['low'].values
+        c = df_4h['close'].values
+        n = len(df_4h)
+        p = SWING_PERIOD_4H
 
-        scan_s = max(0, current_bar - ZONE_LOOKBACK)
-        zones  = _find_zones(H, L, C, V, ATR, scan_s, current_bar)
-        zones  = _enrich_zones(H, L, C, ATR, zones)
+        swing_highs = [(i, h[i]) for i in range(p, n-p)
+                       if h[i] == max(h[max(0,i-p):i+p+1])]
+        swing_lows  = [(i, l[i]) for i in range(p, n-p)
+                       if l[i] == min(l[max(0,i-p):i+p+1])]
 
-        # Flip bonus
-        for z in zones:
-            if z.is_flip:
-                z.confluence += 2
+        if len(swing_highs) < 2 or len(swing_lows) < 2: return None
 
-        # Filters
-        zones = [z for z in zones if z.confluence >= MIN_CONFLUENCE]
-        zones = [z for z in zones if (current_bar - z.formed_at) <= ZONE_MAX_AGE]
-        zones.sort(key=lambda z: (int(z.is_flip), z.confluence), reverse=True)
+        last_bos = None
+        for i in range(max(0, n-BOS_LOOKBACK), n):
+            rsh = [s for s in swing_highs if s[0] < i]
+            rsl = [s for s in swing_lows  if s[0] < i]
+            if not rsh or not rsl: continue
 
-        # Prune old cache entries
-        if len(self._zone_cache) > 200:
-            oldest = sorted(self._zone_cache.keys())[0]
-            del self._zone_cache[oldest]
+            if c[i] > rsh[-1][1]:
+                sl_b = max(s[1] for s in rsl[-3:])
+                last_bos = {
+                    'direction': 'LONG', 'bias': 'BULLISH',
+                    'swing_low': sl_b,
+                    'swing_high': max(h[i:]) if i < n-1 else h[i],
+                    'bos_level': rsh[-1][1],
+                }
+            elif c[i] < rsl[-1][1]:
+                sh_b = min(s[1] for s in rsh[-3:])
+                last_bos = {
+                    'direction': 'SHORT', 'bias': 'BEARISH',
+                    'swing_low': min(l[i:]) if i < n-1 else l[i],
+                    'swing_high': sh_b,
+                    'bos_level': rsl[-1][1],
+                }
+        return last_bos
 
-        self._zone_cache[cache_key] = (zones, datetime.now())
-        return zones
+    # ── STEP 2: Location (1H) ─────────────────────────────────
 
-    # ── Signal detection ───────────────────────────────────────
+    def find_poi_1h(self, df_1h, direction, sw_low, sw_high):
+        pois = []
+        if len(df_1h) < 10: return pois
+        h=df_1h['high'].values; l=df_1h['low'].values
+        o=df_1h['open'].values; c=df_1h['close'].values
+        n = len(df_1h)
+        eq50 = (sw_high + sw_low) / 2
+        cur  = c[-1]
 
-    def _detect_signal(self, symbol: str, df1h: pd.DataFrame) -> Optional[dict]:
-        """
-        Runs the full v7 S&D detection on a 1H dataframe.
-        Returns a signal dict or None.
-        """
-        if len(df1h) < ZONE_LOOKBACK + 20:
-            return None
+        if direction == 'LONG' and cur > eq50 * 1.03: return []
+        if direction == 'SHORT' and cur < eq50 * 0.97: return []
 
-        H   = df1h['high'].values.astype(float)
-        L   = df1h['low'].values.astype(float)
-        C   = df1h['close'].values.astype(float)
-        O   = df1h['open'].values.astype(float)
-        V   = df1h['volume'].values.astype(float)
-        ATR = _calc_atr(H, L, C, ATR_PERIOD)
-        T4H = _calc_4h_trend(df1h)
+        for i in range(2, n-2):
+            body = abs(c[i]-o[i])
+            rng  = h[i]-l[i]
+            if rng == 0: continue
 
-        i   = len(df1h) - 1   # latest completed bar
-        atr = ATR[i]
-        if atr < 1e-9:
-            return None
+            if direction == 'LONG' and c[i] < o[i]:
+                nb = any(c[j]>o[j] and (c[j]-o[j])>body for j in range(i+1, min(i+4,n)))
+                if not nb: continue
+                ot=o[i]; ob=c[i]; om=(ot+ob)/2
+                if ot >= cur: continue
+                pos = (om-sw_low)/(sw_high-sw_low) if sw_high!=sw_low else 0.5
+                if pos > DISCOUNT_MAX: continue
+                mit = any(l[j]<ob for j in range(i+1,n))
+                age = n-1-i
+                if mit or age > POI_MAX_AGE_1H: continue
+                pois.append({'top':ot,'btm':ob,'mid':om,'age':age,'pos':pos,'eq50':eq50})
 
-        t1h = _detect_trend_1h(H, L, C, i, TREND_LOOKBACK_1H)
-        t4h = T4H[i]
-
-        zones = self._get_cached_zones(symbol, H, L, C, V, ATR, i)
-
-        for z in zones:
-            buf = atr * 0.3
-
-            # ── DEMAND / LONG ─────────────────────────────
-            if z.kind == 'demand' and t1h in ('uptrend', 'range'):
-                if t4h == 'bear':
-                    continue
-
-                in_zone = L[i] <= z.top + buf and H[i] >= z.bottom - buf * 2
-                if not in_zone:
-                    continue
-
-                rej, rej_type = _is_rejection_candle(O, H, L, C, i, atr, 'demand')
-                if not rej:
-                    self.stats['filtered']['no_rej'] += 1
-                    continue
-
-                ok, blk = _passes_all_filters(O, H, L, C, V, ATR, i, atr,
-                                              rej_type, t1h, z)
-                if not ok:
-                    self.stats['filtered'][blk] = self.stats['filtered'].get(blk, 0) + 1
-                    continue
-
-                # FIX 5: confirm HL in uptrend
-                if t1h == 'uptrend' and not _confirmed_higher_low(H, L, i):
-                    self.stats['filtered']['fix5'] += 1
-                    continue
-
-                entry = z.top
-                sl    = z.bottom - atr * ATR_SL_BUFFER
-                risk  = abs(entry - sl)
-                if risk < 1e-9:
-                    continue
-                tp1 = entry + risk * TP1_R
-                tp2 = entry + risk * TP2_R
-
-                return self._build_signal(
-                    symbol, 'LONG', entry, sl, tp1, tp2,
-                    atr, z, t1h, t4h, rej_type, risk
-                )
-
-            # ── SUPPLY / SHORT ────────────────────────────
-            elif z.kind == 'supply' and t1h in ('downtrend', 'range'):
-                if t4h == 'bull':
-                    continue
-
-                in_zone = H[i] >= z.bottom - buf and L[i] <= z.top + buf * 2
-                if not in_zone:
-                    continue
-
-                rej, rej_type = _is_rejection_candle(O, H, L, C, i, atr, 'supply')
-                if not rej:
-                    self.stats['filtered']['no_rej'] += 1
-                    continue
-
-                ok, blk = _passes_all_filters(O, H, L, C, V, ATR, i, atr,
-                                              rej_type, t1h, z)
-                if not ok:
-                    self.stats['filtered'][blk] = self.stats['filtered'].get(blk, 0) + 1
-                    continue
-
-                # FIX 5: confirm LH in downtrend
-                if t1h == 'downtrend' and not _confirmed_lower_high(H, L, i):
-                    self.stats['filtered']['fix5'] += 1
-                    continue
-
-                entry = z.bottom
-                sl    = z.top + atr * ATR_SL_BUFFER
-                risk  = abs(sl - entry)
-                if risk < 1e-9:
-                    continue
-                tp1 = entry - risk * TP1_R
-                tp2 = entry - risk * TP2_R
-
-                return self._build_signal(
-                    symbol, 'SHORT', entry, sl, tp1, tp2,
-                    atr, z, t1h, t4h, rej_type, risk
-                )
-
-        return None
-
-    def _build_signal(
-        self, symbol: str, direction: str,
-        entry: float, sl: float, tp1: float, tp2: float,
-        atr: float, zone: SDZone,
-        trend_1h: str, trend_4h: str, rej_type: str, risk: float
-    ) -> dict:
-        pair = symbol.replace('/USDT:USDT', '')
-        tid  = f"{pair}_{direction[0]}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        rr   = round(abs(tp1 - entry) / max(risk, 1e-9), 2)
-
-        def pct(a, b):
-            return round(abs(a - b) / max(abs(b), 1e-9) * 100, 2)
-
-        # Confluence tag for message
-        tags = []
-        if zone.is_flip:
-            tags.append('🔄 Flip zone')
-        if zone.move_atr >= 3.0:
-            tags.append(f'⚡ Strong move {zone.move_atr}x ATR')
-        rej_emoji = {'pin_bar': '📍', 'bull_engulf': '🟢', 'bear_engulf': '🔴', 'strong_close': '💪'}
-        tags.append(f"{rej_emoji.get(rej_type,'●')} {rej_type.replace('_',' ').title()}")
-        trend_tag = f"1H {trend_1h} · 4H {trend_4h}"
+            elif direction == 'SHORT' and c[i] > o[i]:
+                nb = any(c[j]<o[j] and (o[j]-c[j])>body for j in range(i+1, min(i+4,n)))
+                if not nb: continue
+                ot=c[i]; ob=o[i]; om=(ot+ob)/2
+                if ob <= cur: continue
+                pos = (om-sw_low)/(sw_high-sw_low) if sw_high!=sw_low else 0.5
+                if pos < PREMIUM_MIN: continue
+                mit = any(h[j]>ot for j in range(i+1,n))
+                age = n-1-i
+                if mit or age > POI_MAX_AGE_1H: continue
+                pois.append({'top':ot,'btm':ob,'mid':om,'age':age,'pos':pos,'eq50':eq50})
 
         if direction == 'LONG':
-            close_plan = (
-                f"📋 <b>Close plan:</b>\n"
-                f"  • TP1 → close <b>{int(TP1_CLOSE_PCT*100)}%</b> → SL to BE\n"
-                f"  • TP2 → close remaining <b>{int((1-TP1_CLOSE_PCT)*100)}%</b> (runner)"
-            )
+            pois.sort(key=lambda x: cur-x['mid'])
         else:
-            close_plan = (
-                f"📋 <b>Close plan:</b>\n"
-                f"  • TP1 → close <b>{int(TP1_CLOSE_PCT*100)}%</b> → SL to BE\n"
-                f"  • TP2 → close remaining <b>{int((1-TP1_CLOSE_PCT)*100)}%</b> (runner)"
-            )
+            pois.sort(key=lambda x: x['mid']-cur)
+        return pois[:5]
 
-        return {
-            'trade_id':    tid,
-            'symbol':      pair,
-            'full_symbol': symbol,
-            'signal':      direction,
-            'entry':       entry,
-            'stop_loss':   sl,
-            'tp1':         tp1, 'tp1_pct': pct(tp1, entry),
-            'tp2':         tp2, 'tp2_pct': pct(tp2, entry),
-            'rr':          rr,
-            'risk_pct':    pct(sl, entry),
-            'atr':         round(atr, 6),
-            'zone_top':    round(zone.top, 6),
-            'zone_bottom': round(zone.bottom, 6),
-            'zone_kind':   zone.kind,
-            'confluence':  zone.confluence,
-            'is_flip':     zone.is_flip,
-            'trend_1h':    trend_1h,
-            'trend_4h':    trend_4h,
-            'rej_type':    rej_type,
-            'tags':        tags,
-            'trend_tag':   trend_tag,
-            'close_plan':  close_plan,
-            'tp1_hit':     False,
-            'tp2_hit':     False,
-            'sl_hit':      False,
-            'be_active':   False,
-            'partial_taken': False,
-            'timestamp':   datetime.now(),
+    # ── STEP 3: Execution (15M) ───────────────────────────────
+
+    def check_15m(self, df_15m, poi, direction):
+        if df_15m is None or len(df_15m) < 10: return False, {}
+        recent = df_15m.iloc[-12:]
+        h=recent['high'].values; l=recent['low'].values
+        c=recent['close'].values; o=recent['open'].values
+        n=len(recent)
+        if n < 4: return False, {}
+
+        # Price at POI?
+        if direction == 'LONG':
+            at_poi = any(l[-POI_REACH_BARS:] <= poi['top']*1.002)
+        else:
+            at_poi = any(h[-POI_REACH_BARS:] >= poi['btm']*0.998)
+        if not at_poi: return False, {}
+
+        rejection=False; bos_close=False; failed_cont=False
+        entry=None; sl=None
+
+        if direction == 'LONG':
+            for i in range(max(0,n-4), n-1):
+                body=c[i]-o[i]; rng=h[i]-l[i]
+                lo_wick=o[i]-l[i] if c[i]>o[i] else c[i]-l[i]
+                if i>0 and c[i]>o[i] and c[i]>o[i-1] and o[i]<c[i-1]:
+                    rejection=True
+                if rng>0 and lo_wick>2*abs(body) and c[i]>o[i]:
+                    rejection=True
+                if rng>0 and body>0.6*rng and c[i]>o[i]:
+                    rejection=True
+                if rejection:
+                    sl=l[i]*(1-SL_BUFFER); entry=c[i]; break
+            if entry and n>=3:
+                bos_close = c[-1] > max(h[-4:-1])
+            if n>=4:
+                made_ll = any(l[-4:-1] < (l[-5] if n>=5 else l[-4]))
+                failed_cont = (made_ll and c[-1]>o[-1]) or (c[-2]<o[-2] and c[-1]>o[-1] and c[-1]>c[-2])
+        else:
+            for i in range(max(0,n-4), n-1):
+                body=o[i]-c[i]; rng=h[i]-l[i]
+                hi_wick=h[i]-o[i] if c[i]<o[i] else h[i]-c[i]
+                if i>0 and c[i]<o[i] and c[i]<o[i-1] and o[i]>c[i-1]:
+                    rejection=True
+                if rng>0 and hi_wick>2*abs(body) and c[i]<o[i]:
+                    rejection=True
+                if rng>0 and body>0.6*rng and c[i]<o[i]:
+                    rejection=True
+                if rejection:
+                    sl=h[i]*(1+SL_BUFFER); entry=c[i]; break
+            if entry and n>=3:
+                bos_close = c[-1] < min(l[-4:-1])
+            if n>=4:
+                made_hh = any(h[-4:-1] > (h[-5] if n>=5 else h[-4]))
+                failed_cont = (made_hh and c[-1]<o[-1]) or (c[-2]>o[-2] and c[-1]<o[-1] and c[-1]<c[-2])
+
+        if REQUIRE_REJECTION   and not rejection:   return False, {}
+        if REQUIRE_BOS_CLOSE   and not bos_close:   return False, {}
+        if REQUIRE_FAILED_CONT and not failed_cont:  return False, {}
+        if entry is None or sl is None:              return False, {}
+        if direction=='LONG'  and sl>=entry:         return False, {}
+        if direction=='SHORT' and sl<=entry:         return False, {}
+
+        risk = abs(entry-sl)
+        tp   = entry+risk*RR if direction=='LONG' else entry-risk*RR
+        risk_pct = risk/entry*100
+
+        return True, {
+            'entry': entry, 'sl': sl, 'tp': tp,
+            'risk': risk, 'risk_pct': risk_pct,
+            'tp_pct': abs(tp-entry)/entry*100,
+            'rejection': rejection, 'bos_close': bos_close,
+            'failed_cont': failed_cont,
         }
 
-    # ── Format Telegram message ────────────────────────────────
+    # ── Scan One Symbol ───────────────────────────────────────
 
-    def _fmt_signal(self, sig: dict) -> str:
-        e  = '🚀' if sig['signal'] == 'LONG' else '🔻'
-        t4 = {'bull': '🐂', 'bear': '🐻', 'neutral': '➡️'}.get(sig['trend_4h'], '➡️')
+    async def scan_symbol(self, symbol):
+        try:
+            d4h  = await self.fetch_tf(symbol, '4h',  80)
+            await asyncio.sleep(0.05)
+            d1h  = await self.fetch_tf(symbol, '1h',  120)
+            await asyncio.sleep(0.05)
+            d15m = await self.fetch_tf(symbol, '15m', 100)
+            await asyncio.sleep(0.05)
 
-        zone_label = '🔄 Flip' if sig['is_flip'] else '🆕 Fresh'
-        conf_bar   = '▰' * min(sig['confluence'], 5) + '▱' * max(0, 5 - sig['confluence'])
+            if len(d4h)<25 or len(d1h)<50 or len(d15m)<20: return None
 
-        m  = f"{'─'*38}\n"
-        m += f"{e} <b>{sig['signal']} — S&D Zone Signal</b>\n"
-        m += f"{'─'*38}\n\n"
-        m += f"<b>Pair:</b>   #{sig['symbol']}  {t4} 4H {sig['trend_4h']}\n"
-        m += f"<b>Trend:</b>  {sig['trend_tag']}\n"
-        m += f"<b>Zone:</b>   {zone_label}  {conf_bar}  ({sig['zone_kind'].upper()})\n"
-        m += f"<b>Entry:</b>  {' + '.join(sig['tags'])}\n\n"
+            # ── STEP 1: Direction ──
+            info = self.get_direction(d4h)
+            if not info: return None
 
-        m += f"<b>Entry:</b>      <code>${sig['entry']:.6f}</code>\n"
-        m += f"<b>TP1:</b>        <code>${sig['tp1']:.6f}</code>  +{sig['tp1_pct']:.2f}%\n"
-        m += f"<b>TP2:</b>        <code>${sig['tp2']:.6f}</code>  +{sig['tp2_pct']:.2f}%\n"
-        m += f"<b>Stop loss:</b>  <code>${sig['stop_loss']:.6f}</code>  -{sig['risk_pct']:.2f}%\n"
-        m += f"<b>RR (TP1):</b>   {sig['rr']}:1\n\n"
+            direction = info['direction']
+            sw_low    = info['swing_low']
+            sw_high   = info['swing_high']
 
-        m += f"<b>Zone:</b>  {sig['zone_bottom']:.6f} — {sig['zone_top']:.6f}\n\n"
+            # Cooldown
+            ck   = (symbol, direction)
+            last = self.cooldown.get(ck)
+            now  = d15m.iloc[-1]['timestamp']
+            if last and (now - last).total_seconds() < COOLDOWN_HOURS*3600:
+                return None
 
-        m += f"{sig['close_plan']}\n\n"
+            # ── STEP 2: Location ──
+            pois = self.find_poi_1h(d1h, direction, sw_low, sw_high)
+            if not pois: return None
+            poi = pois[0]
 
-        m += f"<i>🆔 {sig['trade_id']}</i>\n"
-        m += f"<i>⏰ {sig['timestamp'].strftime('%H:%M UTC')} | SD v1.0</i>"
+            # Price at POI on 1H?
+            cur = d1h.iloc[-1]['close']
+            if direction == 'LONG':
+                at_1h = d1h.iloc[-1]['low'] <= poi['top']*1.003
+            else:
+                at_1h = d1h.iloc[-1]['high'] >= poi['btm']*0.997
+            if not at_1h: return None
+
+            # ── STEP 3: Execution on 15M ──
+            ok, exec_info = self.check_15m(d15m, poi, direction)
+            if not ok: return None
+
+            fk = (symbol, direction, str(poi['top'])[:8])
+            if fk in self.fired: return None
+            self.fired.add(fk)
+            self.cooldown[ck] = now
+
+            entry    = exec_info['entry']
+            sl       = exec_info['sl']
+            tp       = exec_info['tp']
+            risk_pct = exec_info['risk_pct']
+            tp_pct   = exec_info['tp_pct']
+            eq50     = poi['eq50']
+            sym      = symbol.replace('/USDT:USDT','')
+            tid      = f"{sym}_{now.strftime('%m%d%H%M')}"
+
+            # POI zone label
+            pos = poi['pos']
+            if direction == 'LONG':
+                zone = 'Extreme Discount' if pos<0.25 else ('Mid Discount' if pos<0.40 else 'Near EQ')
+            else:
+                zone = 'Extreme Premium' if pos>0.75 else ('Mid Premium' if pos>0.60 else 'Near EQ')
+
+            # Confluence tags
+            conf_tags = []
+            if exec_info['rejection']:   conf_tags.append('Rejection')
+            if exec_info['bos_close']:   conf_tags.append('BOS Close')
+            if exec_info['failed_cont']: conf_tags.append('Failed Cont')
+
+            return {
+                'trade_id':  tid,
+                'symbol':    sym,
+                'full':      symbol,
+                'signal':    direction,
+                'bias':      info['bias'],
+                'timestamp': now,
+                'entry':     entry,
+                'sl':        sl,
+                'tp':        tp,
+                'risk_pct':  round(risk_pct, 3),
+                'tp_pct':    round(tp_pct, 2),
+                'rr':        RR,
+                'eq50':      eq50,
+                'sw_low':    sw_low,
+                'sw_high':   sw_high,
+                'zone':      zone,
+                'conf_tags': ' | '.join(conf_tags),
+                'tp1_hit': False, 'sl_hit': False,
+                'be_active': False,
+            }
+        except Exception as e:
+            logger.debug(f'{symbol}: {e}')
+            return None
+
+    # ── Signal Message ────────────────────────────────────────
+
+    def fmt_signal(self, sig):
+        arrow = '📉' if sig['signal']=='SHORT' else '📈'
+        bias  = '🐻 BEARISH' if sig['bias']=='BEARISH' else '🐂 BULLISH'
+        m  = f"{'─'*42}\n"
+        m += f"{arrow} <b>BRETT A+ SETUP — {sig['signal']}</b>\n"
+        m += f"{'─'*42}\n\n"
+        m += f"<b>Pair:</b>      #{sig['symbol']}\n"
+        m += f"<b>Direction:</b> {bias}  (4H BOS confirmed)\n"
+        m += f"<b>Location:</b>  {sig['zone']}\n"
+        m += f"<b>Confirm:</b>   {sig['conf_tags']}\n\n"
+        m += f"<b>Entry:</b>  <code>${sig['entry']:.6g}</code>\n"
+        m += f"<b>SL:</b>     <code>${sig['sl']:.6g}</code>  -{sig['risk_pct']:.2f}%\n"
+        m += f"<b>TP:</b>     <code>${sig['tp']:.6g}</code>  +{sig['tp_pct']:.2f}%\n"
+        m += f"<b>RR:</b>     1:{sig['rr']:.0f}  (risk 1% → target +{sig['rr']:.0f}%)\n\n"
+        m += f"<b>Swing range:</b>  ${sig['sw_low']:.6g} → ${sig['sw_high']:.6g}\n"
+        m += f"<b>50% EQ:</b>       ${sig['eq50']:.6g}\n\n"
+        m += f"📋 <b>Brett Rules:</b>\n"
+        m += f"  • Risk max 1% of account\n"
+        m += f"  • SL = rejection candle extreme\n"
+        m += f"  • TP = exactly 3R — no early exits\n"
+        m += f"  • If any confluence missing → no trade\n\n"
+        m += f"<i>ID: {sig['trade_id']} | {sig['timestamp'].strftime('%d %b %H:%M UTC')}</i>"
         return m
 
-    # ── Telegram ───────────────────────────────────────────────
+    # ── Telegram ──────────────────────────────────────────────
 
-    async def _send(self, text: str):
+    async def send_msg(self, text):
         try:
-            await self.telegram_bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
+            await self.bot.send_message(
+                chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.error(f"Telegram send: {e}")
+            logger.error(f'Telegram: {e}')
 
-    # ── Trade alerts ───────────────────────────────────────────
+    # ── TP/SL Alerts ──────────────────────────────────────────
 
-    async def _tp1_alert(self, t: dict, price: float):
-        gain = abs((price - t['entry']) / t['entry'] * 100)
-        next_tp = f"${t['tp2']:.6f} (+{t['tp2_pct']:.2f}%)"
-        m  = f"✅ <b>TP1 HIT</b> ✅\n\n"
-        m += f"<b>{t['symbol']}</b> {t['signal']}\n"
-        m += f"Entry: ${t['entry']:.6f}\n"
-        m += f"TP1:   ${price:.6f}  <b>+{gain:.2f}%</b>\n\n"
-        m += f"✂️ Close <b>{int(TP1_CLOSE_PCT*100)}%</b> of position\n"
-        m += f"🔒 Move SL → breakeven (${t['entry']:.6f})\n"
-        m += f"🎯 Next: {next_tp}\n"
+    async def _tp_alert(self, t, price):
+        gain = abs((price-t['entry'])/t['entry']*100)
+        m  = f"✅ <b>TP HIT — BRETT 3R</b>\n\n"
+        m += f"<b>{t['symbol']}</b>  {t['signal']}\n"
+        m += f"Entry: <code>${t['entry']:.6g}</code>\n"
+        m += f"TP:    <code>${price:.6g}</code>  <b>+{gain:.2f}% (+3R)</b>\n\n"
+        m += f"Full position closed at 3R — Brett's rule.\n"
         m += f"\n<i>{t['trade_id']}</i>"
-        await self._send(m)
-        t['tp1_hit']      = True
-        t['be_active']    = True
-        t['partial_taken'] = True
-        self.stats['tp1_hits'] += 1
+        await self.send_msg(m)
+        self.stats['tp_hits'] += 1
 
-    async def _tp2_alert(self, t: dict, price: float):
-        gain = abs((price - t['entry']) / t['entry'] * 100)
-        m  = f"💰 <b>TP2 HIT — FULL TARGET!</b> 💰\n\n"
-        m += f"<b>{t['symbol']}</b> {t['signal']}\n"
-        m += f"Entry: ${t['entry']:.6f}\n"
-        m += f"TP2:   ${price:.6f}  <b>+{gain:.2f}%</b>\n\n"
-        m += f"✅ Close remaining <b>{int((1-TP1_CLOSE_PCT)*100)}%</b> — trade complete\n"
-        m += f"\n<i>{t['trade_id']}</i>"
-        await self._send(m)
-        t['tp2_hit'] = True
-        self.stats['tp2_hits'] += 1
-
-    async def _sl_alert(self, t: dict, price: float, be_save: bool = False):
-        if be_save:
-            m  = f"🔒 <b>BREAKEVEN CLOSE</b>\n\n"
-            m += f"<b>{t['symbol']}</b> {t['signal']}\n"
-            m += f"TP1 was hit ✅ — SL was at entry\n"
-            m += f"Closed remainder at breakeven — <b>zero loss</b>\n"
-            m += f"\n<i>{t['trade_id']}</i>"
+    async def _sl_alert(self, t, price, be=False):
+        if be:
+            m  = f"🔒 <b>BREAKEVEN CLOSE</b>\n\n<b>{t['symbol']}</b>  {t['signal']}\n"
+            m += f"TP1 saved — closed at entry — no loss\n\n<i>{t['trade_id']}</i>"
             self.stats['be_saves'] += 1
         else:
-            loss = abs((price - t['entry']) / t['entry'] * 100)
-            m  = f"⛔ <b>STOP LOSS</b>\n\n"
-            m += f"<b>{t['symbol']}</b> {t['signal']}\n"
-            m += f"Entry: ${t['entry']:.6f}\n"
-            m += f"SL:    ${price:.6f}  <b>-{loss:.2f}%</b>\n\n"
-            m += f"<i>Next zone incoming 🎯</i>"
+            loss = abs((price-t['entry'])/t['entry']*100)
+            m  = f"⛔ <b>STOP LOSS — -1R</b>\n\n<b>{t['symbol']}</b>  {t['signal']}\n"
+            m += f"Entry: <code>${t['entry']:.6g}</code>\n"
+            m += f"SL:    <code>${price:.6g}</code>  <b>-{loss:.2f}% (-1R)</b>\n"
+            m += f"\nBrett says: losses are part of the system. EV still positive.\n"
+            m += f"\n<i>{t['trade_id']}</i>"
             self.stats['sl_hits'] += 1
-        await self._send(m)
+        await self.send_msg(m)
 
-    # ── Trade tracker ──────────────────────────────────────────
+    # ── Trade Tracker (every 1 min for 15M trades) ────────────
 
-    async def _track_trades(self):
-        logger.info("📡 Trade tracker started")
+    async def track_trades(self):
+        logger.info('Trade tracker started')
         while True:
             try:
                 if not self.active_trades:
-                    await asyncio.sleep(30)
-                    continue
+                    await asyncio.sleep(60); continue
 
                 done = []
                 for tid, t in list(self.active_trades.items()):
                     try:
-                        # Timeout
-                        if datetime.now() - t['timestamp'] > timedelta(hours=MAX_TRADE_HOURS):
-                            logger.info(f"⏰ Timeout: {t['symbol']}")
+                        age_h = (datetime.now(timezone.utc)-t['timestamp']).total_seconds()/3600
+                        if age_h > MAX_TRADE_BARS * 0.25:  # 15M bars → hours
+                            m = f"⏰ <b>TIMEOUT</b> — <b>{t['symbol']}</b>\nNo TP/SL in 5 days. Close manually."
+                            await self.send_msg(m)
                             self.stats['timeouts'] += 1
-                            done.append(tid)
-                            continue
+                            done.append(tid); continue
 
-                        ticker = await self.exchange.fetch_ticker(t['full_symbol'])
+                        ticker = await self.exchange.fetch_ticker(t['full'])
                         price  = ticker['last']
-                        act_sl = t['entry'] if t['be_active'] else t['stop_loss']
+                        d      = t['signal']
+                        act_sl = t['entry'] if t['be_active'] else t['sl']
 
-                        if t['signal'] == 'LONG':
-                            if not t['tp1_hit'] and price >= t['tp1']:
-                                await self._tp1_alert(t, price)
-                            if t['tp1_hit'] and not t['tp2_hit'] and price >= t['tp2']:
-                                await self._tp2_alert(t, price)
-                                done.append(tid); continue
-                            if price <= act_sl:
-                                await self._sl_alert(t, price, be_save=t['be_active'])
-                                done.append(tid); continue
-                        else:  # SHORT
-                            if not t['tp1_hit'] and price <= t['tp1']:
-                                await self._tp1_alert(t, price)
-                            if t['tp1_hit'] and not t['tp2_hit'] and price <= t['tp2']:
-                                await self._tp2_alert(t, price)
-                                done.append(tid); continue
-                            if price >= act_sl:
-                                await self._sl_alert(t, price, be_save=t['be_active'])
-                                done.append(tid); continue
+                        if d == 'LONG':
+                            if price >= t['tp']:
+                                await self._tp_alert(t, price); done.append(tid)
+                            elif price <= act_sl:
+                                await self._sl_alert(t, price, t['be_active']); done.append(tid)
+                        else:
+                            if price <= t['tp']:
+                                await self._tp_alert(t, price); done.append(tid)
+                            elif price >= act_sl:
+                                await self._sl_alert(t, price, t['be_active']); done.append(tid)
 
+                        await asyncio.sleep(0.2)
                     except Exception as e:
-                        logger.error(f"Track {tid}: {e}")
+                        logger.error(f'Track {tid}: {e}')
 
                 for tid in done:
                     self.active_trades.pop(tid, None)
 
-                await asyncio.sleep(30)
-
-            except Exception as e:
-                logger.error(f"Tracker loop: {e}")
                 await asyncio.sleep(60)
 
-    # ── Pair list ──────────────────────────────────────────────
+            except Exception as e:
+                logger.error(f'Tracker: {e}'); await asyncio.sleep(30)
 
-    async def _get_pairs(self) -> List[str]:
-        try:
-            await self.exchange.load_markets()
-            tickers = await self.exchange.fetch_tickers()
-            pairs = [
-                s for s in self.exchange.symbols
-                if s.endswith('/USDT:USDT')
-                and 'PERP' not in s
-                and tickers.get(s, {}).get('quoteVolume', 0) > MIN_VOLUME_USDT
-            ]
-            pairs.sort(
-                key=lambda x: tickers.get(x, {}).get('quoteVolume', 0),
-                reverse=True
-            )
-            return pairs[:TOP_PAIRS_LIMIT]
-        except Exception as e:
-            logger.error(f"get_pairs: {e}")
-            return []
+    # ── Main Scan ─────────────────────────────────────────────
 
-    # ── Main scan ──────────────────────────────────────────────
-
-    async def scan_all(self) -> List[dict]:
-        if self.is_scanning:
-            return []
+    async def scan_all(self):
+        if self.is_scanning: return
         self.is_scanning = True
         signals = []
 
-        pairs = await self._get_pairs()
-        logger.info(f"🔍 Scanning {len(pairs)} pairs...")
+        try:
+            await self.exchange.load_markets()
+            tickers = await self.exchange.fetch_tickers()
+            pairs = [s for s in self.exchange.symbols
+                     if s.endswith('/USDT:USDT') and 'PERP' not in s
+                     and tickers.get(s,{}).get('quoteVolume',0) > MIN_VOLUME_USDT]
+            pairs.sort(key=lambda x: tickers.get(x,{}).get('quoteVolume',0), reverse=True)
+            pairs = pairs[:MAX_PAIRS]
+            logger.info(f'Brett scan | {len(pairs)} pairs')
 
-        for symbol in pairs:
-            try:
-                df1h = await self._fetch_ohlcv(symbol, '1h', limit=120)
-                if df1h is None or len(df1h) < 90:
+            for idx, pair in enumerate(pairs):
+                try:
+                    sig = await self.scan_symbol(pair)
+                    if sig:
+                        self.active_trades[sig['trade_id']] = sig
+                        self.signal_history.append(sig)
+                        signals.append(sig)
+                        self.stats['total'] += 1
+                        if sig['signal']=='LONG': self.stats['long'] += 1
+                        else:                     self.stats['short'] += 1
+                        await self.send_msg(self.fmt_signal(sig))
+                        logger.info(f"A+ SETUP: {sig['symbol']} {sig['signal']} | {sig['conf_tags']} | 3R")
+                        await asyncio.sleep(1)
                     await asyncio.sleep(0.2)
-                    continue
+                except Exception as e:
+                    logger.error(f'Scan {pair}: {e}')
 
-                sig = self._detect_signal(symbol, df1h)
-                if sig is None:
-                    await asyncio.sleep(0.2)
-                    continue
+        except Exception as e:
+            logger.error(f'Scan error: {e}')
 
-                # Cooldown: same pair+direction max once per 4H
-                ck   = f"{sig['symbol']}_{sig['signal']}"
-                last = self.pair_cooldown.get(ck)
-                if last and (datetime.now() - last).total_seconds() < 4 * 3600:
-                    self.stats['filtered']['cooldown'] = \
-                        self.stats['filtered'].get('cooldown', 0) + 1
-                    await asyncio.sleep(0.2)
-                    continue
-
-                self.pair_cooldown[ck] = datetime.now()
-                self.active_trades[sig['trade_id']] = sig
-                self.signal_history.append(sig)
-
-                self.stats['total_signals'] += 1
-                if sig['signal'] == 'LONG':
-                    self.stats['long_signals'] += 1
-                else:
-                    self.stats['short_signals'] += 1
-
-                await self._send(self._fmt_signal(sig))
-                signals.append(sig)
-                logger.info(
-                    f"✅ {sig['symbol']} {sig['signal']} {sig['rej_type']} "
-                    f"zone={sig['zone_kind']} flip={sig['is_flip']} "
-                    f"1H={sig['trend_1h']} 4H={sig['trend_4h']}"
-                )
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Scan {symbol}: {e}")
-
-            await asyncio.sleep(0.3)
-
-        self.stats['last_scan']     = datetime.now()
-        self.stats['pairs_scanned'] = len(pairs)
-
-        filtered = self.stats['filtered']
-        logger.info(
-            f"✅ Scan done | {len(signals)} signals | "
-            f"filtered: no_rej={filtered.get('no_rej',0)} "
-            f"f1={filtered.get('fix1',0)} f2={filtered.get('fix2',0)} "
-            f"f5={filtered.get('fix5',0)} f6a={filtered.get('fix6a',0)} "
-            f"f6b={filtered.get('fix6b',0)} f7={filtered.get('fix7',0)} "
-            f"cooldown={filtered.get('cooldown',0)} | "
-            f"tracking={len(self.active_trades)}"
-        )
+        self.stats['last_scan'] = datetime.now()
+        logger.info(f'Scan done | {len(signals)} A+ setups | tracking: {len(self.active_trades)}')
         self.is_scanning = False
-        return signals
 
-    # ── Daily report ───────────────────────────────────────────
+    # ── Daily Report ──────────────────────────────────────────
 
-    async def _daily_report(self):
+    async def daily_report(self):
         while True:
-            await asyncio.sleep(24 * 3600)
+            await asyncio.sleep(24*3600)
             try:
                 s   = self.stats
-                tp1 = s['tp1_hits']; tp2 = s['tp2_hits']
-                sl  = s['sl_hits'];  be  = s['be_saves']
-                tot = tp1 + sl
-                wr  = round(tp1 / tot * 100, 1) if tot > 0 else 0
-                hrs = round((datetime.now() - s['session_start']).total_seconds() / 3600, 1)
+                tp  = s['tp_hits']; sl = s['sl_hits']; be = s['be_saves']
+                tot = tp + sl
+                wr  = round(tp/max(tot,1)*100, 1)
+                ev  = round((wr/100*RR) - ((100-wr)/100), 3)
+                hrs = round((datetime.now()-s['start']).total_seconds()/3600, 1)
+                bar = '▰'*int(wr/10)+'▱'*(10-int(wr/10))
 
-                cutoff   = datetime.now() - timedelta(hours=24)
-                day_sigs = [t for t in self.signal_history if t['timestamp'] >= cutoff]
-                day_long  = sum(1 for t in day_sigs if t['signal'] == 'LONG')
-                day_short = sum(1 for t in day_sigs if t['signal'] == 'SHORT')
-
-                bar = '▰' * int(wr / 10) + '▱' * (10 - int(wr / 10))
-
-                m  = f"{'─'*36}\n📅 <b>24H REPORT — SD Scanner v1.0</b>\n{'─'*36}\n\n"
+                m  = f"{'─'*40}\n📅 <b>BRETT DAILY REPORT</b>\n{'─'*40}\n\n"
                 m += f"Session: {hrs}h\n\n"
-                m += f"<b>── Today's Signals ──</b>\n"
-                m += f"  Total: <b>{len(day_sigs)}</b>  ({day_long}L / {day_short}S)\n\n"
-                m += f"<b>── Performance ──</b>\n"
-                m += f"  ✅ TP1 hits:  <b>{tp1}</b>\n"
-                m += f"  💰 TP2 hits:  <b>{tp2}</b>  ({round(tp2/max(tp1,1)*100)}% extended)\n"
-                m += f"  🔒 BE saves:  <b>{be}</b>\n"
-                m += f"  ❌ SL hits:   <b>{sl}</b>\n\n"
-                m += f"<b>TP1 Win Rate: {wr}%</b>\n{bar}\n\n"
-
-                if wr >= 75:   status = "🔥 Excellent — strategy working"
-                elif wr >= 60: status = "✅ Good — within target range"
-                elif wr >= 50: status = "⚠️ Watch closely"
-                else:          status = "🚨 Below target — check market conditions"
-                m += f"{status}\n\n"
-
-                flt = s['filtered']
-                m += f"<b>Filters today:</b>\n"
-                m += f"  No rejection:  {flt.get('no_rej',0)}\n"
-                m += f"  FIX1 (trend):  {flt.get('fix1',0)}\n"
-                m += f"  FIX7 (SC rng): {flt.get('fix7',0)}\n"
-                m += f"  FIX6B (stall): {flt.get('fix6b',0)}\n"
-                m += f"  Cooldown:      {flt.get('cooldown',0)}\n\n"
-                m += f"  Tracking: {len(self.active_trades)} trades\n"
-                m += f"<i>⏰ {datetime.now().strftime('%d %b %Y %H:%M UTC')}</i>"
-                await self._send(m)
-
+                m += f"<b>Signals:</b> {s['total']} total\n"
+                m += f"  📈 Long: {s['long']}  |  📉 Short: {s['short']}\n\n"
+                m += f"<b>Results:</b>\n"
+                m += f"  ✅ TP (3R): <b>{tp}</b>\n"
+                m += f"  🔒 BE save: <b>{be}</b>\n"
+                m += f"  ❌ SL (-1R): <b>{sl}</b>\n"
+                m += f"  ⏰ Timeout: <b>{s['timeouts']}</b>\n\n"
+                m += f"<b>Win Rate: {wr}%</b>  (need >25% to profit)\n{bar}\n"
+                m += f"<b>EV: {ev:+.2f}R per trade</b>\n\n"
+                m += f"Active trades: {len(self.active_trades)}\n"
+                m += f"<i>Backtest baseline: 72.7% TP | +1.91R EV</i>"
+                await self.send_msg(m)
             except Exception as e:
-                logger.error(f"Daily report: {e}")
-
-    # ── Run ────────────────────────────────────────────────────
+                logger.error(f'Daily report: {e}')
 
     async def run(self):
-        logger.info(
-            f"🚀 SD Scanner v1.0 | "
-            f"IMBAL={IMBAL_ATR_MULT}x ATR | "
-            f"TP1={TP1_R}R TP2={TP2_R}R | "
-            f"Rejection=pin/engulf | All 7 fixes ON"
-        )
-        asyncio.create_task(self._track_trades())
-        asyncio.create_task(self._daily_report())
-
+        logger.info('=== BRETT 3-STEP SCANNER v1.0 STARTED ===')
+        logger.info(f'Direction→Location→Execution | 3R fixed | {MAX_PAIRS} pairs')
+        asyncio.create_task(self.track_trades())
+        asyncio.create_task(self.daily_report())
+        # Initial scan
+        await self.scan_all()
         while True:
-            try:
-                await self.scan_all()
-                await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
-            except Exception as e:
-                logger.error(f"Run loop: {e}")
-                await asyncio.sleep(60)
+            await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
+            await self.scan_all()
 
     async def close(self):
         await self.exchange.close()
 
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # TELEGRAM COMMANDS
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
-class BotCommands:
-    def __init__(self, scanner: SDScanner):
-        self.s = scanner
+class Commands:
+    def __init__(self, s: BrettScanner): self.s = s
 
-    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🏦 <b>Supply & Demand Scanner v1.0</b>\n"
-            "82.7% WR backtest · Pin/Engulf signals · 1.8R target\n\n"
-            "Commands:\n"
-            "/scan   — force scan now\n"
-            "/stats  — session stats\n"
-            "/trades — active trades\n"
-            "/zones  — explain zone logic\n"
-            "/help   — this message",
-            parse_mode=ParseMode.HTML
-        )
+    async def cmd_start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        m  = "📊 <b>Brett 3-Step Scanner v1.0</b>\n\n"
+        m += "<b>Framework:</b>\n"
+        m += "  4H → Direction (BOS + swing range)\n"
+        m += "  1H → Location (50% EQ + unmitigated POI)\n"
+        m += "  15M → Execution (all 3 confluences)\n\n"
+        m += "<b>Rules:</b>\n"
+        m += "  TP = exactly 3R (no exceptions)\n"
+        m += "  SL = rejection candle extreme\n"
+        m += "  Risk = 1% max per trade\n\n"
+        m += "<b>Backtest (180d, 300 pairs):</b>\n"
+        m += "  72.7% TP | +1.91R avg | Max DD -3R\n"
+        m += "  Breakeven = 25% ← we're at 72.7%\n\n"
+        m += "/scan /stats /trades /help"
+        await u.message.reply_text(m, parse_mode=ParseMode.HTML)
 
-    async def cmd_scan(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def cmd_scan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         if self.s.is_scanning:
-            await update.message.reply_text("⚠️ Scan already running!")
-            return
-        await update.message.reply_text("🔍 Scanning now...")
+            await u.message.reply_text('Scan already running!'); return
+        await u.message.reply_text('🔍 Scanning for A+ Brett setups...')
         asyncio.create_task(self.s.scan_all())
 
-    async def cmd_stats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        s   = self.s.stats
-        tp1 = s['tp1_hits']; tp2 = s['tp2_hits']
-        sl  = s['sl_hits'];  be  = s['be_saves']
-        tot = tp1 + sl
-        wr  = round(tp1 / tot * 100, 1) if tot > 0 else 0
-        hrs = round((datetime.now() - s['session_start']).total_seconds() / 3600, 1)
-        spd = round(s['total_signals'] / max(hrs, 0.1), 2)
-        flt = s['filtered']
-
-        m  = f"📊 <b>SD SCANNER STATS</b>\n\nSession: {hrs}h\n\n"
-        m += f"<b>Signals:</b> {s['total_signals']} ({spd}/h)\n"
-        m += f"  🟢 Long:  {s['long_signals']}\n"
-        m += f"  🔴 Short: {s['short_signals']}\n\n"
-        m += f"<b>Performance:</b>\n"
-        m += f"  ✅ TP1: {tp1}  ({wr}% WR)\n"
-        m += f"  💰 TP2: {tp2}  ({round(tp2/max(tp1,1)*100)}% of TP1s ran)\n"
-        m += f"  🔒 BE:  {be}\n"
-        m += f"  ❌ SL:  {sl}\n\n"
-        m += f"<b>Filters fired:</b>\n"
-        m += f"  No rejection:     {flt.get('no_rej',0)}\n"
-        m += f"  FIX1 trend:       {flt.get('fix1',0)}\n"
-        m += f"  FIX2 SC context:  {flt.get('fix2',0)}\n"
-        m += f"  FIX5 swing:       {flt.get('fix5',0)}\n"
-        m += f"  FIX6A vol gate:   {flt.get('fix6a',0)}\n"
-        m += f"  FIX6B stall:      {flt.get('fix6b',0)}\n"
-        m += f"  FIX7 SC in rng:   {flt.get('fix7',0)}\n"
-        m += f"  Cooldown:         {flt.get('cooldown',0)}\n\n"
-        m += f"Tracking: {len(self.s.active_trades)} trades"
+    async def cmd_stats(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        s  = self.s.stats
+        tp = s['tp_hits']; sl = s['sl_hits']
+        wr = round(tp/max(tp+sl,1)*100, 1)
+        ev = round((wr/100*RR)-((100-wr)/100), 3)
+        hrs= round((datetime.now()-s['start']).total_seconds()/3600, 1)
+        m  = f"📊 <b>Brett Stats</b>\n\nSession: {hrs}h\n\n"
+        m += f"Signals: {s['total']}  (📈{s['long']} 📉{s['short']})\n\n"
+        m += f"✅ TP: {tp}  |  ❌ SL: {sl}  |  🔒 BE: {s['be_saves']}\n"
+        m += f"Win Rate: <b>{wr}%</b>  EV: <b>{ev:+.2f}R</b>\n\n"
+        m += f"Active: {len(self.s.active_trades)}\n"
         if s['last_scan']:
-            m += f"\nLast scan: {s['last_scan'].strftime('%H:%M')}"
-        await update.message.reply_text(m, parse_mode=ParseMode.HTML)
+            m += f"Last scan: {s['last_scan'].strftime('%H:%M UTC')}"
+        await u.message.reply_text(m, parse_mode=ParseMode.HTML)
 
-    async def cmd_trades(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        trades = self.s.active_trades
-        if not trades:
-            await update.message.reply_text("📭 No active trades.")
-            return
-        m = f"📡 <b>ACTIVE TRADES ({len(trades)})</b>\n\n"
-        for tid, t in list(trades.items())[:10]:
-            age   = int((datetime.now() - t['timestamp']).total_seconds() / 3600)
-            tp1_s = '✅' if t['tp1_hit'] else '⏳'
-            tp2_s = '✅' if t['tp2_hit'] else '⏳'
-            be_s  = ' 🔒BE' if t['be_active'] else ''
-            flip_s = ' 🔄' if t['is_flip'] else ''
-            m += f"<b>{t['symbol']}</b> {t['signal']}{be_s}{flip_s}\n"
-            m += f"  Entry: ${t['entry']:.6f} | Zone: {t['zone_kind']}\n"
-            m += f"  {t['rej_type'].replace('_',' ')} · {t['trend_1h']} · {age}h old\n"
-            m += f"  TP1:{tp1_s} TP2:{tp2_s}\n\n"
-        await update.message.reply_text(m, parse_mode=ParseMode.HTML)
+    async def cmd_trades(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        t = self.s.active_trades
+        if not t:
+            await u.message.reply_text('No active trades.'); return
+        m = f"📡 <b>Active Trades ({len(t)})</b>\n\n"
+        for tid, tr in list(t.items())[:8]:
+            age = round((datetime.now(timezone.utc)-tr['timestamp']).total_seconds()/3600, 1)
+            m += f"<b>{tr['symbol']}</b> {tr['signal']} | {age}h ago\n"
+            m += f"  Entry: <code>${tr['entry']:.6g}</code>  TP: <code>${tr['tp']:.6g}</code>  (3R)\n"
+            m += f"  {tr['conf_tags']}\n\n"
+        await u.message.reply_text(m, parse_mode=ParseMode.HTML)
 
-    async def cmd_zones(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        m  = "🏦 <b>ZONE LOGIC — SD v1.0</b>\n\n"
-        m += "<b>Zone types:</b>\n"
-        m += "  📥 <b>Demand</b> = Drop → Base → Rally (DBR)\n"
-        m += "  📤 <b>Supply</b> = Rally → Base → Drop (RBD)\n\n"
-        m += "<b>Quality gates:</b>\n"
-        m += f"  • Base range   &lt; {CONSOL_ATR_MULT}x ATR (consolidation)\n"
-        m += f"  • Move in/out  ≥ {IMBAL_ATR_MULT}x ATR (institutional)\n"
-        m += f"  • Min conf     ≥ {MIN_CONFLUENCE} (vol spike or big move)\n"
-        m += f"  • Max age      ≤ {ZONE_MAX_AGE} bars\n"
-        m += f"  • Flip zones   get +2 confluence bonus\n\n"
-        m += "<b>Entry conditions (ALL must pass):</b>\n"
-        m += "  1️⃣ Price enters zone ±0.3x ATR buffer\n"
-        m += "  2️⃣ Rejection candle = pin bar or engulf\n"
-        m += "  3️⃣ 4H trend not opposing (no LONG in 4H bear)\n"
-        m += "  4️⃣ 1H structure confirmed (HL/LH check)\n"
-        m += "  5️⃣ No elevated vol during entry (FIX 6A)\n"
-        m += "  6️⃣ Stall confirm for range engulfs (FIX 6B)\n\n"
-        m += "<b>Trade management:</b>\n"
-        m += f"  SL  = zone edge ± {ATR_SL_BUFFER}x ATR\n"
-        m += f"  TP1 = {TP1_R}R → close {int(TP1_CLOSE_PCT*100)}%, SL → BE\n"
-        m += f"  TP2 = {TP2_R}R → close remaining {int((1-TP1_CLOSE_PCT)*100)}%\n"
-        m += f"  Timeout: {MAX_TRADE_HOURS}h\n\n"
-        m += "<b>Backtested results (v7):</b>\n"
-        m += "  WR: 82.7% · PF: 21.5 · Max DD: -1.8%\n"
-        await update.message.reply_text(m, parse_mode=ParseMode.HTML)
-
-    async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await self.cmd_start(update, ctx)
+    async def cmd_help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        m  = "📚 <b>Brett 3-Step Rules</b>\n\n"
+        m += "<b>STEP 1 — Direction (4H):</b>\n"
+        m += "  Most recent BOS → bias direction\n"
+        m += "  Mark swing range. Ignore everything outside.\n\n"
+        m += "<b>STEP 2 — Location (1H):</b>\n"
+        m += "  50% EQ = premium/discount line\n"
+        m += "  LONG only in discount + demand POI\n"
+        m += "  SHORT only in premium + supply POI\n"
+        m += "  POI must be unmitigated\n\n"
+        m += "<b>STEP 3 — Execution (15M):</b>\n"
+        m += "  1. Rejection candle (engulf/pin/displacement)\n"
+        m += "  2. BOS close (close beyond prior candle)\n"
+        m += "  3. Failed continuation (trap)\n"
+        m += "  ALL 3 required → A+ setup only\n\n"
+        m += "<b>Trade:</b>\n"
+        m += f"  TP = 3R fixed | SL = candle extreme | Risk 1%\n\n"
+        m += "/scan /stats /trades"
+        await u.message.reply_text(m, parse_mode=ParseMode.HTML)
 
 
-# ══════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
 
 async def main():
-    # ╔══════════════════════════════════════╗
-    TELEGRAM_TOKEN   = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
-    TELEGRAM_CHAT_ID = "-1003659830260"
-    BINANCE_API_KEY  = None   # read-only key for market data (optional)
-    BINANCE_SECRET   = None
-    # ╚══════════════════════════════════════╝
-
-    scanner = SDScanner(
-        telegram_token    = TELEGRAM_TOKEN,
-        telegram_chat_id  = TELEGRAM_CHAT_ID,
-        binance_api_key   = BINANCE_API_KEY,
-        binance_secret    = BINANCE_SECRET,
-    )
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    cmds = BotCommands(scanner)
+    scanner = BrettScanner()
+    app     = Application.builder().token(TELEGRAM_TOKEN).build()
+    cmds    = Commands(scanner)
 
     for cmd, fn in [
         ('start', cmds.cmd_start),
         ('scan',  cmds.cmd_scan),
         ('stats', cmds.cmd_stats),
         ('trades',cmds.cmd_trades),
-        ('zones', cmds.cmd_zones),
         ('help',  cmds.cmd_help),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
     await app.initialize()
     await app.start()
-    logger.info("🤖 SD Scanner v1.0 online")
 
     try:
-        await scanner.run()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        await asyncio.gather(
+            scanner.run(),
+            app.updater.start_polling(),
+        )
+    except (KeyboardInterrupt, SystemExit):
+        logger.info('Shutting down...')
     finally:
         await scanner.close()
         await app.stop()
         await app.shutdown()
-
 
 if __name__ == '__main__':
     asyncio.run(main())
