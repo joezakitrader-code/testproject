@@ -1,5 +1,5 @@
 """
-HYBRID FVG PULLBACK SCANNER v1.0 - Futures + Volume Filter
+HYBRID FVG PULLBACK SCANNER v1.0 - Full Features Like Your Old Bot
 """
 
 import asyncio
@@ -22,7 +22,10 @@ TELEGRAM_TOKEN = "7957028587:AAE7aSYtE4hCxxTIPkAs_1ULJ9e8alkY6Ic"
 TELEGRAM_CHAT_ID = "-1003659830260"
 # =================================================================
 
-PAIRS = []
+PAIRS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'AVAX/USDT',
+    'LINK/USDT', 'APT/USDT', 'SUI/USDT', 'WIF/USDT', 'PEPE/USDT', 'FTM/USDT'
+]
 
 SCAN_INTERVAL_MIN = 15
 MAX_TRADE_HOURS = 72
@@ -61,43 +64,6 @@ class LiveTrade:
     tp1_hit: bool = False
     be_active: bool = False
 
-# ===================== LOAD FUTURES PAIRS =====================
-
-async def load_usdt_pairs():
-    global exchange, PAIRS
-
-    if exchange is None:
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
-        })
-
-    markets = await exchange.load_markets()
-
-    PAIRS = []
-    
-    for symbol, data in markets.items():
-        try:
-            if (
-                symbol.endswith('/USDT') and
-                data['active'] and
-                data.get('linear', False)
-            ):
-                ticker = await exchange.fetch_ticker(symbol)
-                vol = ticker.get('quoteVolume', 0)
-
-                if vol and vol >= 500000:
-                    PAIRS.append(symbol)
-
-                await asyncio.sleep(0.1)
-
-        except:
-            continue
-
-    logger.info(f"Loaded {len(PAIRS)} FUTURES USDT pairs (vol ≥ 500k)")
-
-# ===================== INDICATORS =====================
-
 def calc_atr(H, L, C, period=14):
     n = len(C)
     tr = np.zeros(n)
@@ -122,12 +88,10 @@ def detect_fvg(H, L, C, i):
     if H[i] < L[i-2]: return 'bear', L[i-2] - H[i]
     return None, 0.0
 
-# ===================== DATA =====================
-
 async def fetch_ohlcv(symbol, tf, limit):
     global exchange
     if exchange is None:
-        exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+        exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
@@ -136,8 +100,6 @@ async def fetch_ohlcv(symbol, tf, limit):
     except Exception as e:
         logger.error(f"Fetch {symbol} {tf}: {e}")
         return None
-
-# ===================== SIGNAL =====================
 
 def build_signal(symbol, direction, entry, sl, tp1, tp2, trend4, fvg_size, entry_type):
     e = "🚀" if direction == "LONG" else "🔻"
@@ -155,10 +117,10 @@ def build_signal(symbol, direction, entry, sl, tp1, tp2, trend4, fvg_size, entry
     m += f"<i>⏰ {datetime.now().strftime('%H:%M UTC')} | Hybrid Scanner</i>"
     return m
 
-# ===================== SCANNER =====================
-
 async def scan_all():
     global exchange
+    if exchange is None:
+        exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
 
     for symbol in PAIRS:
         try:
@@ -195,13 +157,13 @@ async def scan_all():
             if (trend4 == 'uptrend' and fvg_dir != 'bull') or (trend4 == 'downtrend' and fvg_dir != 'bear'):
                 continue
 
+            # Rejection candle
             i = b15
             atr = ATR15[i]
             o, h, l, c = O15[i], H15[i], L15[i], C15[i]
             rng = h - l
             valid = False
             entry_type = ""
-
             if trend4 == 'uptrend' and c > o and (c - l) / max(rng, 1e-9) > 0.55:
                 valid = True
                 entry_type = "Bullish Rejection"
@@ -228,7 +190,9 @@ async def scan_all():
             signal_text = build_signal(symbol.replace('/USDT',''), direction, entry, sl, tp1, tp2, trend4, fvg_size, entry_type)
 
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=signal_text, parse_mode=ParseMode.HTML)
+            logger.info(f"Signal: {symbol} {direction}")
 
+            # Add to active trades
             tid = f"{symbol.replace('/USDT','')}_{direction[0]}_{datetime.now().strftime('%H%M%S')}"
             active_trades[tid] = LiveTrade(symbol=symbol.replace('/USDT',''), direction=direction,
                                            entry=entry, sl=sl, tp1=tp1, tp2=tp2, entry_time=datetime.now())
@@ -237,20 +201,116 @@ async def scan_all():
             if direction == 'LONG': stats['long_signals'] += 1
             else: stats['short_signals'] += 1
 
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)
 
         except Exception as e:
             logger.error(f"Scan error {symbol}: {e}")
 
     stats['last_scan'] = datetime.now()
 
-# ===================== MAIN =====================
+async def track_trades():
+    while True:
+        try:
+            done = []
+            for tid, t in list(active_trades.items()):
+                try:
+                    ticker = await exchange.fetch_ticker(t.symbol + '/USDT')
+                    price = ticker['last']
 
+                    if t.direction == 'LONG':
+                        if not t.tp1_hit and price >= t.tp1:
+                            await send_tp1_alert(t, price)
+                            t.tp1_hit = True
+                            t.be_active = True
+                        elif t.tp1_hit and price >= t.tp2:
+                            await send_tp2_alert(t, price)
+                            done.append(tid)
+                        elif price <= (t.entry if t.be_active else t.sl):
+                            await send_sl_alert(t, price, t.be_active)
+                            done.append(tid)
+                    else:  # SHORT
+                        if not t.tp1_hit and price <= t.tp1:
+                            await send_tp1_alert(t, price)
+                            t.tp1_hit = True
+                            t.be_active = True
+                        elif t.tp1_hit and price <= t.tp2:
+                            await send_tp2_alert(t, price)
+                            done.append(tid)
+                        elif price >= (t.entry if t.be_active else t.sl):
+                            await send_sl_alert(t, price, t.be_active)
+                            done.append(tid)
+
+                    if (datetime.now() - t.entry_time).total_seconds() / 3600 > MAX_HOURS:
+                        done.append(tid)
+                except:
+                    pass
+
+            for tid in done:
+                active_trades.pop(tid, None)
+
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"Tracker error: {e}")
+            await asyncio.sleep(60)
+
+async def send_tp1_alert(t, price):
+    m = f"✅ <b>TP1 HIT</b> ✅\n\n<b>{t.symbol}</b> {t.direction}\nEntry: {t.entry:.6f}\nTP1: {price:.6f}\n\n✂️ Close 50% | SL → BE\nRunner: {t.tp2:.6f}"
+    await bot.send_message(TELEGRAM_CHAT_ID, m, parse_mode=ParseMode.HTML)
+    stats['tp1_hits'] += 1
+
+async def send_tp2_alert(t, price):
+    m = f"💰 <b>TP2 HIT - FULL TARGET!</b> 💰\n\n<b>{t.symbol}</b> {t.direction}\nEntry: {t.entry:.6f}\nTP2: {price:.6f}"
+    await bot.send_message(TELEGRAM_CHAT_ID, m, parse_mode=ParseMode.HTML)
+    stats['tp2_hits'] += 1
+
+async def send_sl_alert(t, price, be_save=False):
+    if be_save:
+        m = f"🔒 <b>BREAKEVEN CLOSE</b>\n\n{t.symbol} {t.direction} closed at BE"
+        stats['be_saves'] += 1
+    else:
+        m = f"⛔ <b>STOP LOSS</b>\n\n{t.symbol} {t.direction}\nEntry: {t.entry:.6f}\nSL: {price:.6f}"
+        stats['sl_hits'] += 1
+    await bot.send_message(TELEGRAM_CHAT_ID, m, parse_mode=ParseMode.HTML)
+
+# Telegram Commands (same as your old bot)
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 <b>Hybrid FVG Pullback Scanner</b>\n"
+        "Trend + FVG + Rejection\n\n"
+        "/scan — force scan now\n"
+        "/stats — session stats\n"
+        "/trades — active trades\n"
+        "/help — commands",
+        parse_mode=ParseMode.HTML)
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    hrs = (datetime.now() - stats['session_start']).total_seconds() / 3600
+    tot = stats['tp1_hits'] + stats['sl_hits']
+    wr = round(stats['tp1_hits']/tot*100,1) if tot > 0 else 0
+    m = f"📊 <b>HYBRID SCANNER STATS</b>\n\nSession: {hrs:.1f}h\n"
+    m += f"Signals: {stats['total_signals']} (L:{stats['long_signals']} S:{stats['short_signals']})\n"
+    m += f"TP1: {stats['tp1_hits']} | TP2: {stats['tp2_hits']} | BE: {stats['be_saves']} | SL: {stats['sl_hits']}\n"
+    m += f"Win Rate: {wr}%"
+    await update.message.reply_text(m, parse_mode=ParseMode.HTML)
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not active_trades:
+        await update.message.reply_text("📭 No active trades.")
+        return
+    m = f"📡 <b>ACTIVE TRADES ({len(active_trades)})</b>\n\n"
+    for tid, t in list(active_trades.items())[:10]:
+        age = int((datetime.now() - t.entry_time).total_seconds()/3600)
+        m += f"<b>{t.symbol}</b> {t.direction}\nEntry: {t.entry:.6f} | Age: {age}h\n\n"
+    await update.message.reply_text(m, parse_mode=ParseMode.HTML)
+
+async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Scanning now...")
+    asyncio.create_task(scan_all())
+
+# Main
 async def main():
     logger.info("🚀 Hybrid FVG Scanner Started")
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("trades", cmd_trades))
@@ -258,8 +318,6 @@ async def main():
 
     await app.initialize()
     await app.start()
-
-    await load_usdt_pairs()  # 👈 IMPORTANT
 
     asyncio.create_task(track_trades())
     asyncio.create_task(main_loop())
