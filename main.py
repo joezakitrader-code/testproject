@@ -59,8 +59,8 @@ BINANCE_SECRET   = None
 
 CFG = dict(
     # Pair universe
-    TOP_PAIRS         = 30,
-    MIN_VOL_USDT      = 5_000_000,   # $5M 24H volume floor
+    TOP_PAIRS         = 600,
+    MIN_VOL_USDT      = 500_000,   # $5M 24H volume floor
     PAIR_BLACKLIST    = {'1000PEPE', 'XRP', 'HYPE'},
     MAX_ATR_PRICE_PCT = 0.030,       # skip if ATR/price > 3%
 
